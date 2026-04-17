@@ -290,12 +290,26 @@ For each source with an available connector, add to `etl_assessment_summary.md`:
 
 > **SSIS CDC components (CDC Control Task, CDC Source, CDC Splitter) are SQL Server CDC feature only.** They do not apply to Oracle without the deprecated Attunity Oracle CDC Service add-on (supported only through SQL Server 2017). Confirm source database before applying.
 
-| Option | Best For | Notes |
-|--------|----------|-------|
-| OpenFlow SQL Server Connector | Managed near-real-time CDC | Recommended; no custom code; handles initial snapshot + streaming |
-| Streams + Dynamic Tables | Declarative, low-ops CDC | Best for continuous refresh; minimal overhead |
-| Streams + Tasks | Full control, complex routing | More SP code to maintain |
-| Snowpipe Streaming | Sub-minute latency | Kafka SDK or API-based |
+**Tier 1 — Direct SQL Server CDC replacement (reads SQL Server change tables):**
+
+| Option | Notes |
+|--------|-------|
+| **OpenFlow SQL Server Connector** | Recommended. Managed service — reads SQL Server CDC change tables directly, handles initial snapshot + streaming changes, no custom code. |
+
+**Tier 2 — Snowflake-side change tracking (data already replicated into Snowflake staging tables):**
+
+| Option | Notes |
+|--------|-------|
+| **Streams + Dynamic Tables** | Declarative, low-ops. Best for continuous refresh patterns with simple transformations. |
+| **Streams + Tasks** | Imperative. Full control over INSERT/UPDATE/DELETE routing via `METADATA$ACTION`. More SP code to maintain. |
+
+> **Note on Snowflake Streams:** Streams track changes on *Snowflake tables* — they do not read from SQL Server. Use Tier 2 only when a bulk replication layer already lands data into Snowflake staging, and you need downstream change propagation within Snowflake.
+
+**Tier 3 — Kafka-based pipeline (requires existing Kafka infrastructure):**
+
+| Option | Notes |
+|--------|-------|
+| Debezium (SQL Server) → Kafka → Snowflake Kafka Connector | True CDC from SQL Server via LogMiner/CDC tables. Snowpipe Streaming API is used at the Kafka Connector layer. Only applicable if Kafka infrastructure exists or is being introduced. |
 
 #### Oracle Source Strategy (Conditional — complete only when Oracle Source or Oracle Destination detected in assessment)
 
