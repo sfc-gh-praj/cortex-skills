@@ -14,36 +14,52 @@ Each skill encodes a domain-specific workflow that Cortex Code follows when you 
 
 ### Option 1 — Reference the raw file URL directly in your prompt
 
-Paste the raw GitHub URL of `requirements.md` into your Cortex Code session and ask it to follow the skill:
+Paste the raw GitHub URL of `SKILL.md` into your Cortex Code session:
 
 ```
-Use the skill at https://raw.githubusercontent.com/sfc-gh-praj/cortex-skills/main/ssis-migration/requirements.md
+Read the skill at:
+https://raw.githubusercontent.com/sfc-gh-praj/cortex-skills/main/ssis-migration/SKILL.md
+
+Follow this skill's workflow for my SSIS migration.
+```
+
+### Option 2 — Clone and load locally
+
+```bash
+git clone https://github.com/sfc-gh-praj/cortex-skills.git
+```
+
+Then in your Cortex Code session:
+```
+Read /path/to/cortex-skills/ssis-migration/SKILL.md
 and follow its workflow for my SSIS migration.
 ```
 
-### Option 2 — Download and load locally
+### Option 3 — Install as a named Cortex Code skill
+
+Copy the `ssis-migration` folder into your Cortex Code skills directory:
 
 ```bash
-# Clone the repo
-git clone https://github.com/sfc-gh-praj/cortex-skills.git
+# macOS / Linux
+cp -r cortex-skills/ssis-migration ~/.snowflake/cortex/skills/
 
-# Point Cortex Code at the local file
-# In your CoCo session:
-# "Read the skill at /path/to/cortex-skills/ssis-migration/requirements.md and follow its workflow"
+# Then invoke it by name in any CoCo session:
+# "Load the ssis-migration skill"
 ```
-
-### Option 3 — Copy into your project
-
-Copy `ssis-migration/requirements.md` into your SSIS project folder. Cortex Code will pick it up when you reference it in the session.
 
 ## Contributing
 
-Each skill lives in its own folder. The folder name is the skill name. Each folder must contain a `requirements.md` file that defines the skill workflow.
+Each skill lives in its own folder. The folder name is the skill name. Each folder must contain a `SKILL.md` that defines the workflow, and optionally a `references/` folder with supporting knowledge files.
 
 ```
 cortex-skills/
 └── <skill-name>/
-    └── requirements.md   ← skill definition (required)
+    ├── SKILL.md              ← skill definition (required)
+    ├── README.md             ← usage instructions (recommended)
+    └── references/           ← supporting knowledge files (optional)
+        ├── snowflake_patterns.md
+        ├── component_mapping_reference.md
+        └── phase3_migration_plan_template.md
 ```
 
 ## Related

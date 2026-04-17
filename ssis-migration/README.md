@@ -39,14 +39,18 @@ Before starting, ensure you have:
 **Option A — From raw GitHub URL:**
 ```
 Read the skill at:
-https://raw.githubusercontent.com/sfc-gh-praj/cortex-skills/main/ssis-migration/requirements.md
+https://raw.githubusercontent.com/sfc-gh-praj/cortex-skills/main/ssis-migration/SKILL.md
 
 Follow this skill's workflow for my SSIS migration.
 ```
 
 **Option B — From local file (after cloning):**
+```bash
+git clone https://github.com/sfc-gh-praj/cortex-skills.git
 ```
-Read /path/to/cortex-skills/ssis-migration/requirements.md
+Then in your Cortex Code session:
+```
+Read /path/to/cortex-skills/ssis-migration/SKILL.md
 and follow its workflow for my SSIS migration.
 ```
 
