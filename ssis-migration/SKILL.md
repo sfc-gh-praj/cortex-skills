@@ -209,6 +209,24 @@ Present findings:
 - Components marked `NotSupported` or with EWI markers
 - Display paths to all generated artifacts
 
+#### OpenFlow Connector Availability Annotation (Mandatory)
+
+After reviewing detected source/destination types in `ETL.Elements.csv`, annotate `etl_assessment_summary.md` with Snowflake OpenFlow connector availability. This informs Phase 2 Source Ingestion and CDC decisions before any architecture choices are made.
+
+| Detected Source/Destination | OpenFlow Connector | Note |
+|-----------------------------|--------------------|------|
+| SQL Server (OLE DB / CDC Source) | Yes — `sqlserver` | CDC-capable; managed near-real-time replication |
+| Oracle (OLE DB / ADO.NET) | Yes — `oracle-embedded-license` or `oracle-independent-license` | Licensing decision + network connectivity must be assessed |
+| MySQL | Yes — `mysql` | CDC-capable |
+| PostgreSQL | Yes — `postgresql` | CDC-capable |
+| SAP BW Source | No | Snowpark Python or certified partner tools |
+| OData Source | No | Airflow HTTP Operator or Snowflake External Function |
+| Azure Blob / ADLS Source | No — native COPY INTO | Use external stage directly |
+| Flat File / ODBC Source | No — native COPY INTO | Snowpipe or COPY INTO from stage |
+
+For each source with an available connector, add to `etl_assessment_summary.md`:
+> `"[Source Type] detected — Snowflake OpenFlow [connector] connector available. Evaluate for Phase 2 Source Ingestion strategy before writing custom ingest code."`
+
 **Log** Phase 1 to `migration_phase_tracking.md` with start datetime, end datetime, duration, and the following stats:
 
 #### Phase 1 Required Stats in Tracking File
@@ -258,11 +276,46 @@ Present findings:
 | External Process (Python/Shell) | Complex file operations |
 | Skip | Files managed externally |
 
-Record selections. **Log** Phase 2 to `migration_phase_tracking.md` with start datetime, end datetime, duration, and the following stats:
+#### Source Ingestion Pattern
+
+| Option | Best For | Notes |
+|--------|----------|-------|
+| COPY INTO (Batch) | File-based ingestion, scheduled loads | Native Snowflake; internal/external stages |
+| Snowpipe (Auto-ingest) | Near-real-time file ingestion | S3/ADLS event triggers |
+| OpenFlow Connector | DB sources (SQL Server, Oracle, MySQL, PostgreSQL) | Managed CDC/bulk replication; see Phase 1 annotation |
+| External Tables | Data stays in cloud storage, query-in-place | No load cost; query performance trade-off |
+| Snowpark Python | Custom/complex sources | Full flexibility; requires Python |
+
+#### CDC / Change Data Capture (Conditional — complete only when CDC Control Task, CDC Source, or CDC Splitter detected in assessment DAG)
+
+> **SSIS CDC components (CDC Control Task, CDC Source, CDC Splitter) are SQL Server CDC feature only.** They do not apply to Oracle without the deprecated Attunity Oracle CDC Service add-on (supported only through SQL Server 2017). Confirm source database before applying.
+
+| Option | Best For | Notes |
+|--------|----------|-------|
+| OpenFlow SQL Server Connector | Managed near-real-time CDC | Recommended; no custom code; handles initial snapshot + streaming |
+| Streams + Dynamic Tables | Declarative, low-ops CDC | Best for continuous refresh; minimal overhead |
+| Streams + Tasks | Full control, complex routing | More SP code to maintain |
+| Snowpipe Streaming | Sub-minute latency | Kafka SDK or API-based |
+
+#### Oracle Source Strategy (Conditional — complete only when Oracle Source or Oracle Destination detected in assessment)
+
+| Scenario | Recommended Approach |
+|----------|----------------------|
+| Oracle reachable from Snowflake cloud (public IP / VPN / Direct Connect) | OpenFlow Oracle Connector (SPCS deployment) |
+| Oracle on-prem, OpenFlow BYOC runtime can be deployed in customer network | OpenFlow Oracle Connector (BYOC deployment) — requires XStream setup + licensing decision |
+| Oracle on-prem, no VPC or network join possible | Blob Storage Intermediary — see options below |
+
+**Blob Storage Intermediary options (on-prem Oracle, no network):**
+- **Debezium** (on-prem, LogMiner) → Kafka → S3/ADLS → Snowpipe — true CDC, open source, no Oracle license needed
+- **Oracle GoldenGate** → Trail files → S3/ADLS → Snowpipe — true CDC, requires GoldenGate license
+- **SQL*Plus/JDBC incremental extract** → CSV/Parquet → S3/ADLS → COPY INTO — near-CDC via high watermark, misses DELETEs
+- **Oracle Data Pump export** → S3/ADLS → COPY INTO — batch only, simplest to implement
+
+Record all selections. **Log** Phase 2 to `migration_phase_tracking.md` with start datetime, end datetime, duration, and the following stats:
 
 #### Phase 2 Required Stats in Tracking File
 
-1. **Implementation Approach Selection** — Table with columns: Decision, Options, Selected
+1. **Implementation Approach Selection** — Table with columns: Decision, Options, Selected (cover all 7 dimensions: Orchestration, Transformations, File Storage, File Movement, Source Ingestion, CDC if applicable, Oracle strategy if applicable)
 2. **Rationale** — Bullet list explaining WHY each approach was selected (not just what was selected)
 
 ---
