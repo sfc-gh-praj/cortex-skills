@@ -23,6 +23,7 @@
 | File System Task (CreateDirectory) | Task | `COPY INTO` with `.dummy` placeholder | FDM SSC-FDM-SSIS0026; Snowflake stages are prefix-based |
 | Precedence Constraint (OnSuccess) | Constraint | Sequential execution or `IF` check | Only Success constraints fully supported |
 | Precedence Constraint (OnFailure) | Constraint | `EXCEPTION WHEN OTHER THEN` | Failure/Completion constraints need manual adjustment |
+| CDC Control Task | Task | Snowflake Streams state management or OpenFlow SQL Server Connector | **SQL Server CDC feature only.** Not converted by SnowConvert — EWI SSC-EWI-SSIS0004. Manages LSN range for CDC processing windows. Snowflake equivalent: track high-watermark via a `cdc_state` table + Streams. |
 
 ### Container Conversion Details
 
@@ -61,6 +62,8 @@
 | Script Component (C#) | Transform | JavaScript/SQL UDFs + seed tables | N/A | EWI SSC-EWI-SSIS0001 |
 | Sort | Transform | `ORDER BY` | N/A | Usually not needed in set-based SQL |
 | Aggregate | Transform | `GROUP BY` | N/A | Standard SQL aggregation |
+| Microsoft.CDCSource | Source | Snowflake Stream on source table | `stg_cdc__{table_name}` | **SQL Server CDC feature only.** Not converted by SnowConvert — EWI SSC-EWI-SSIS0001. Reads INSERT/UPDATE/DELETE changes from SQL Server CDC change tables. Snowflake equivalent: `SELECT * FROM STREAM(table_stream)` or OpenFlow SQL Server Connector. |
+| Microsoft.CDCSplitter | Transform | Stream + `METADATA$ACTION` filter | `int_cdc__{table_name}` | **SQL Server CDC feature only.** Not converted — EWI SSC-EWI-SSIS0001. Splits net changes into INSERT/UPDATE/DELETE paths. Snowflake equivalent: `CASE WHEN METADATA$ACTION = 'INSERT' ... WHEN METADATA$ACTION = 'DELETE'` on Stream rows, or three separate CTEs. |
 
 **Note**: Unlisted Control Flow elements generate EWI SSC-EWI-SSIS0004. Unlisted Data Flow components generate EWI SSC-EWI-SSIS0001.
 
@@ -72,9 +75,184 @@ EXECUTE DBT PROJECT schema.project_name ARGS='build --target dev'
 ```
 Deploy dbt projects first using: `snow dbt deploy --schema <schema> --database <db> --force <package_name>`
 
-## Script Component Migration Patterns
+## CDC Component Migration Patterns
 
-### C# Script Component → Snowflake UDFs
+> **Scope note:** SSIS CDC components (CDC Control Task, CDC Source, CDC Splitter) are designed exclusively for the **SQL Server CDC feature**. They do NOT apply to Oracle databases without the separate deprecated "Microsoft Change Data Capture Designer and Service for Oracle by Attunity" add-on (supported only through SQL Server 2017). If Oracle CDC was used via SSIS, confirm with the customer whether that Attunity add-on was in use before applying these patterns.
+
+### CDC Architecture Comparison
+
+```
+SSIS CDC Pattern:
+  CDC Control Task → establishes LSN processing range
+       ↓
+  CDC Source       → reads change rows from SQL Server change tables
+       ↓
+  CDC Splitter     → routes INSERTs / UPDATEs / DELETEs to separate paths
+       ↓
+  OLE DB Destinations (INSERT, MERGE, DELETE targets)
+
+Snowflake Equivalent (Streams + Tasks):
+  Snowflake Stream  → tracks INSERT/UPDATE/DELETE on source table
+       ↓
+  Task (scheduled) → reads stream, applies METADATA$ACTION filter
+       ↓
+  CASE WHEN METADATA$ACTION = 'INSERT' → INSERT INTO target
+  CASE WHEN METADATA$ACTION = 'DELETE' → DELETE FROM target
+  CASE WHEN METADATA$ACTION = 'UPDATE' → MERGE INTO target
+       ↓
+  Target table (same semantic result)
+```
+
+### Component-by-Component Migration
+
+#### CDC Control Task → State Table Pattern
+
+The CDC Control Task tracks the LSN (Log Sequence Number) processing window. Snowflake has no LSN concept — state is managed via a control table or Stream offsets.
+
+```sql
+-- Create a CDC state tracking table (replaces CDC Control Task state store)
+CREATE TABLE IF NOT EXISTS cdc_state (
+    table_name       VARCHAR NOT NULL,
+    last_processed   TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP(),
+    stream_offset    VARCHAR,   -- Snowflake stream offset token if needed
+    status           VARCHAR DEFAULT 'idle',
+    PRIMARY KEY (table_name)
+);
+
+-- At start of CDC Task run (replaces "Mark Initial Load Start" CDC Control mode)
+UPDATE cdc_state SET status = 'running', last_processed = CURRENT_TIMESTAMP()
+WHERE table_name = 'your_table';
+
+-- At end of CDC Task run (replaces "Mark CDC Processing End" mode)
+UPDATE cdc_state SET status = 'idle' WHERE table_name = 'your_table';
+```
+
+**When to use OpenFlow instead:** If the source is SQL Server and near-real-time CDC is required, use the **OpenFlow SQL Server Connector** — it handles LSN tracking, initial snapshot, and streaming changes natively with no custom state management code.
+
+#### CDC Source → Snowflake Stream
+
+The CDC Source reads change rows from SQL Server CDC change tables. Snowflake Streams provide the equivalent — a change feed on any table.
+
+```sql
+-- Create a stream on the source table (replaces CDC Source)
+CREATE OR REPLACE STREAM sales_stream ON TABLE sales_source
+    SHOW_INITIAL_ROWS = TRUE;   -- captures initial snapshot rows on first consumption
+
+-- Read all pending changes (replaces CDC Source output)
+SELECT
+    *,
+    METADATA$ACTION,       -- 'INSERT' or 'DELETE' (UPDATE = DELETE + INSERT pair)
+    METADATA$ISUPDATE,     -- TRUE if this row is part of an UPDATE operation
+    METADATA$ROW_ID        -- unique row identifier within the stream
+FROM sales_stream;
+```
+
+**Important:** Snowflake Streams represent UPDATEs as a DELETE + INSERT pair when `SHOW_INITIAL_ROWS = FALSE`. Use `METADATA$ISUPDATE = TRUE` to distinguish UPDATE deletes from true deletes.
+
+#### CDC Splitter → METADATA$ACTION Filter
+
+The CDC Splitter routes INSERTs, UPDATEs, and DELETEs to separate output paths. In Snowflake, this is done with conditional logic on `METADATA$ACTION`.
+
+```sql
+-- Replaces CDC Splitter — three separate CTEs for each change type
+WITH stream_data AS (
+    SELECT *, METADATA$ACTION, METADATA$ISUPDATE
+    FROM sales_stream
+),
+inserts AS (
+    SELECT * FROM stream_data
+    WHERE METADATA$ACTION = 'INSERT' AND METADATA$ISUPDATE = FALSE
+),
+updates AS (
+    -- UPDATEs arrive as DELETE+INSERT pair; capture only the INSERT half
+    SELECT * FROM stream_data
+    WHERE METADATA$ACTION = 'INSERT' AND METADATA$ISUPDATE = TRUE
+),
+deletes AS (
+    SELECT * FROM stream_data
+    WHERE METADATA$ACTION = 'DELETE' AND METADATA$ISUPDATE = FALSE
+)
+-- Apply each CTE to its target operation:
+-- INSERT INTO target SELECT * FROM inserts;
+-- MERGE INTO target USING updates ...;
+-- DELETE FROM target WHERE id IN (SELECT id FROM deletes);
+```
+
+### Recommended Snowflake CDC Approaches
+
+| Approach | When to Use | Complexity |
+|----------|-------------|------------|
+| **OpenFlow SQL Server Connector** | SQL Server source, near-real-time required (<5 min latency), no custom code preferred | Low — managed service |
+| **Streams + Dynamic Tables** | Declarative continuous refresh, simple transformations, low operational overhead | Low — declarative |
+| **Streams + Tasks** | Full control over change processing logic, complex routing or multi-target fan-out | Medium — SP code required |
+| **Snowpipe Streaming** | Sub-minute latency, Kafka-based source pipeline already exists | High — infrastructure required |
+
+### Full Streams + Tasks CDC Implementation Pattern
+
+For complex SSIS CDC packages migrated to Streams + Tasks:
+
+```sql
+-- 1. Create stream on replicated source table
+CREATE OR REPLACE STREAM sales_cdc_stream ON TABLE source_db.sales;
+
+-- 2. Create task to process changes on schedule
+CREATE OR REPLACE TASK process_sales_cdc
+    WAREHOUSE = COMPUTE_WH
+    SCHEDULE = '1 minute'
+    WHEN SYSTEM$STREAM_HAS_DATA('sales_cdc_stream')
+AS
+DECLARE
+    v_insert_count INT DEFAULT 0;
+    v_update_count INT DEFAULT 0;
+    v_delete_count INT DEFAULT 0;
+BEGIN
+    -- Inserts (replaces CDC Splitter INSERT path)
+    INSERT INTO target_db.sales
+    SELECT col1, col2, col3, CURRENT_TIMESTAMP() AS load_ts
+    FROM sales_cdc_stream
+    WHERE METADATA$ACTION = 'INSERT' AND METADATA$ISUPDATE = FALSE;
+    v_insert_count := SQLROWCOUNT;
+
+    -- Updates (replaces CDC Splitter UPDATE path)
+    MERGE INTO target_db.sales AS tgt
+    USING (
+        SELECT col1, col2, col3
+        FROM sales_cdc_stream
+        WHERE METADATA$ACTION = 'INSERT' AND METADATA$ISUPDATE = TRUE
+    ) AS src ON tgt.id = src.col1
+    WHEN MATCHED THEN UPDATE SET tgt.col2 = src.col2, tgt.col3 = src.col3;
+    v_update_count := SQLROWCOUNT;
+
+    -- Deletes (replaces CDC Splitter DELETE path)
+    DELETE FROM target_db.sales
+    WHERE id IN (
+        SELECT col1 FROM sales_cdc_stream
+        WHERE METADATA$ACTION = 'DELETE' AND METADATA$ISUPDATE = FALSE
+    );
+    v_delete_count := SQLROWCOUNT;
+
+    -- Audit log (replaces SSIS CDC package OnPostExecute event handler)
+    INSERT INTO cdc_audit_log (table_name, inserts, updates, deletes, processed_at)
+    VALUES ('sales', :v_insert_count, :v_update_count, :v_delete_count, CURRENT_TIMESTAMP());
+
+    RETURN 'CDC complete: ' || :v_insert_count || ' ins, ' ||
+           :v_update_count || ' upd, ' || :v_delete_count || ' del';
+END;
+```
+
+### Oracle CDC via SSIS — Special Case
+
+If the SSIS project used Oracle as a CDC source via the **Attunity Oracle CDC Service for SQL Server** (a separate deprecated add-on), the migration path depends on Oracle network accessibility:
+
+| Scenario | Snowflake Target Pattern |
+|----------|-------------------------|
+| Oracle reachable from Snowflake cloud | OpenFlow Oracle Connector (SPCS) — XStream-based CDC |
+| Oracle on-prem, BYOC allowed | OpenFlow Oracle Connector (BYOC) |
+| Oracle on-prem, no network join | Blob Storage Intermediary: Debezium (LogMiner) → Kafka → S3 → Snowpipe, or GoldenGate → S3 → Snowpipe |
+
+See Phase 2 Oracle Source Strategy questionnaire for full decision tree.
+
+## Script Component Migration Patterns
 
 When a C# Script Component processes rows:
 
@@ -107,6 +285,8 @@ END;
 | SSIS Connection Type | Snowflake Object |
 |---------------------|-----------------|
 | OLEDB (SQL Server) | Database.Schema reference |
+| OLEDB (Oracle) | OpenFlow Oracle Connector (if reachable) / Blob Storage Intermediary (if on-prem isolated) |
+| CDC (SQL Server CDC feature) | Snowflake Stream on replicated table / OpenFlow SQL Server Connector |
 | Flat File | Stage + File Format |
 | FILE (directory) | Stage with DIRECTORY enabled |
 | SMTP | Notification Integration + `SYSTEM$SEND_EMAIL` |
@@ -133,8 +313,8 @@ END;
 
 | Code | Severity | Meaning | Resolution |
 |------|----------|---------|------------|
-| SSC-EWI-SSIS0001 | Critical | Component not supported (e.g., Script Component) | Manual rewrite as UDFs + seed tables |
-| SSC-EWI-SSIS0004 | High | Control Flow element not supported (Script Task, For Loop, etc.) | Rewrite as Snowflake Scripting or WHILE loop |
+| SSC-EWI-SSIS0001 | Critical | Component not supported (e.g., Script Component, CDC Source, CDC Splitter) | Manual rewrite as UDFs + seed tables (Script Component) or Streams + METADATA$ACTION filter (CDC Source/Splitter) |
+| SSC-EWI-SSIS0004 | High | Control Flow element not supported (Script Task, For Loop, CDC Control Task, etc.) | Rewrite as Snowflake Scripting, WHILE loop, or cdc_state table pattern |
 | SSC-EWI-SSIS0005 | Medium | Async execution — TASK runs async, not sync like SSIS | Convert to SP for synchronous behavior |
 | SSC-EWI-SSIS0008 | Medium | External package reference needs verification | Verify path and convert to CALL |
 | SSC-EWI-SSIS0011 | Medium | Result set binding on non-query | Use sequence NEXTVAL or MAX(id) pattern |
