@@ -185,9 +185,8 @@ deletes AS (
 | **Tier 1 — Direct SQL Server CDC** | OpenFlow SQL Server Connector | SQL Server source; reads CDC change tables directly; no custom code; recommended first choice |
 | **Tier 2 — Snowflake-side tracking** | Streams + Dynamic Tables | Data already bulk-loaded into Snowflake staging; need downstream declarative change propagation |
 | **Tier 2 — Snowflake-side tracking** | Streams + Tasks | Same as above; need imperative INSERT/UPDATE/DELETE routing or multi-target fan-out |
-| **Tier 3 — Kafka pipeline** | Debezium → Kafka → Snowflake Kafka Connector (Snowpipe Streaming at ingestion layer) | Kafka infrastructure already exists or is being introduced; Snowpipe Streaming is the ingestion API used by the Kafka Connector — it is not itself a CDC solution |
 
-> **Important:** Snowflake Streams track changes on *Snowflake tables* — they cannot read from SQL Server CDC change tables directly. Tier 2 requires a prior bulk replication step to land data into Snowflake first. Snowpipe Streaming requires data pushed via Kafka/SDK and is not a standalone CDC option.
+> **Important:** Snowflake Streams track changes on *Snowflake tables* — they cannot read from SQL Server CDC change tables directly. Tier 2 requires a prior bulk replication step to land data into Snowflake first.
 
 ### Full Streams + Tasks CDC Implementation Pattern
 

@@ -305,12 +305,6 @@ For each source with an available connector, add to `etl_assessment_summary.md`:
 
 > **Note on Snowflake Streams:** Streams track changes on *Snowflake tables* — they do not read from SQL Server. Use Tier 2 only when a bulk replication layer already lands data into Snowflake staging, and you need downstream change propagation within Snowflake.
 
-**Tier 3 — Kafka-based pipeline (requires existing Kafka infrastructure):**
-
-| Option | Notes |
-|--------|-------|
-| Debezium (SQL Server) → Kafka → Snowflake Kafka Connector | True CDC from SQL Server via LogMiner/CDC tables. Snowpipe Streaming API is used at the Kafka Connector layer. Only applicable if Kafka infrastructure exists or is being introduced. |
-
 #### Oracle Source Strategy (Conditional — complete only when Oracle Source or Oracle Destination detected in assessment)
 
 | Scenario | Recommended Approach |
@@ -384,6 +378,74 @@ Confirm with user:
 - Target Database/Schema
 - Snowflake Connection name
 - Warehouse name
+
+### Step 4.1a: OpenFlow Connector Deployment (Conditional — only when OpenFlow was selected in Phase 2 for Source Ingestion or CDC)
+
+**⚠️ MANDATORY STOPPING POINT before generating SQL scripts**: If the user selected any OpenFlow connector in Phase 2 (Source Ingestion Pattern or CDC dimension), deploy and validate the connector first. The OpenFlow connector creates the destination schemas and tables — SQL implementation scripts must align with the replicated table structure.
+
+#### Which connector to deploy
+
+| Phase 2 Selection | Connector to Deploy |
+|-------------------|---------------------|
+| Source Ingestion → OpenFlow Connector (SQL Server source) | `sqlserver` |
+| Source Ingestion → OpenFlow Connector (Oracle source, Embedded license) | `oracle-embedded-license` |
+| Source Ingestion → OpenFlow Connector (Oracle source, BYOL) | `oracle-independent-license` |
+| Source Ingestion → OpenFlow Connector (MySQL source) | `mysql` |
+| Source Ingestion → OpenFlow Connector (PostgreSQL source) | `postgresql` |
+| CDC → OpenFlow SQL Server Connector | `sqlserver` |
+
+#### Parameters to collect before invoking OpenFlow skill
+
+From the assessment output (`ETL.Elements.csv`, connection managers) and user input:
+
+**For SQL Server (`sqlserver` connector):**
+- Source: SQL Server connection URL (`jdbc:sqlserver://host:1433;databaseName=db`)
+- Source username and password
+- Tables to replicate — derive from OLE DB Source / CDC Source components in the assessment DAG
+- Snowflake destination database (from Step 4.1)
+- Snowflake role and warehouse
+
+**For Oracle (`oracle-embedded-license` or `oracle-independent-license`):**
+- Oracle version (12cR1+) and platform (on-prem / OCI / RDS Custom)
+- Oracle Connection URL and XStream Out Server URL
+- XStream Outbound Server name
+- Connect username and password
+- Tables to replicate — derive from Oracle Source components in the assessment DAG
+- Core count + core factor (Embedded license only)
+- Snowflake destination database, role, warehouse
+
+#### Invoke the OpenFlow skill
+
+Tell the user:
+> "Your Phase 2 selection includes an OpenFlow connector. I'll now invoke the `openflow` skill to deploy and configure it. This must complete and validate successfully before we generate the SQL implementation scripts."
+
+**Invoke** the `openflow` skill and follow its full deployment workflow:
+1. Network access (EAI) — if SPCS deployment
+2. Network validation — test connectivity to source database endpoint
+3. Deploy connector flow
+4. Configure source, destination, and ingestion parameters (use tables identified from assessment DAG)
+5. Upload JDBC driver (SQL Server / MySQL / PostgreSQL — not needed for Oracle, OCI driver is bundled)
+6. Verify controllers (before enabling)
+7. Enable controllers
+8. Verify processors (after enabling)
+9. For Oracle: verify XStream connectivity via CaptureChangeOracle processor
+10. Start the flow
+11. Validate data is flowing — confirm destination schemas and tables created in Snowflake
+
+**⚠️ Do NOT proceed to Step 4.2 until the OpenFlow connector is running and data has been validated flowing into Snowflake.**
+
+#### Post-OpenFlow actions before Step 4.2
+
+Once OpenFlow is validated:
+1. Note the Snowflake destination schema and table names created by the connector (these will be lowercase if `CASE_SENSITIVE` identifier resolution was used — SQL scripts must quote them)
+2. Confirm which tables are being replicated — these become the source tables for downstream SP/dbt transformations
+3. Add an entry to `solution_artifacts_generated.md`: `OpenFlow [connector] connector — deployed and validated, replicating [N] tables from [source] to [destination_schema]`
+
+#### If OpenFlow deployment fails
+
+- Resolve connectivity or configuration issues using the `openflow` skill troubleshooting workflows
+- Do NOT fall back to custom COPY INTO/Snowpipe without explicitly re-presenting the Phase 2 Source Ingestion options to the user and getting a new selection
+- Log the failure and resolution in `migration_phase_tracking.md`
 
 ### Step 4.2: Generate Implementation Files
 
