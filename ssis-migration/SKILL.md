@@ -550,8 +550,13 @@ Once OpenFlow is validated:
 > **Speed tip**: If SnowConvert converted SQL files exist (verified in Step 1.1), adopt them directly. Do NOT regenerate files that are already converted. Only write new files for gaps and apply targeted fixes for EWI/FDM markers.
 
 1. **Copy** SnowConvert-converted SQL files into `<OUTPUT_DIR>/implementation/sql/` with numbered prefixes
-2. **Open each file** and scan for EWI/FDM inline comment markers (e.g. `-- EWI: SSC-EWI-*`, `-- FDM: SSC-FDM-*`)
-3. **Fix only the marked sections** — apply targeted rewrites for each EWI/FDM using `references/snowflake_patterns.md`; leave all non-marked code untouched
+2. **Scan every file** for blocking EWI markers using:
+   ```bash
+   grep -rn "!!!RESOLVE EWI!!!" <SNOWCONVERT_OUTPUT_DIR>/
+   ```
+   Blocking markers look like: `!!!RESOLVE EWI!!! /*** SSC-EWI-SSIS0014 - MESSAGE ***/!!!`
+   Informational markers look like: `--** SSC-FDM-SSIS0005 - MESSAGE **` — these require no code change.
+3. **Fix each blocking marker** — for every `!!!RESOLVE EWI!!!` found, look up the EWI code in `references/snowflake_patterns.md` → **EWI / FDM Fix Reference** section. Apply the documented fix action. For codes not in the table, consult the public docs linked at the top of that section.
 4. **Write new files only** for objects SnowConvert did not produce: orchestrator SP, Task DAG, file format (if missing), test data
 5. Log which files were adopted as-is, which were patched, and which were written from scratch in `solution_artifacts_generated.md`
 

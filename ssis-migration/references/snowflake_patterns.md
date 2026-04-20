@@ -6,6 +6,94 @@ Proven patterns from real SSIS-to-Snowflake migrations. Use these as templates w
 
 ---
 
+## EWI / FDM Fix Reference
+
+SnowConvert embeds two types of inline markers in converted SQL files.
+
+### Marker Format
+
+**Blocking — must be fixed before SQL can run:**
+```sql
+!!!RESOLVE EWI!!! /*** SSC-EWI-SSIS0014 - THE FOLDER PATH REQUIRES MANUAL MAPPING TO A SNOWFLAKE STAGE. ***/!!!
+```
+
+**Informational — code still runs, but behaviour differs from SSIS:**
+```sql
+--** SSC-FDM-SSIS0005 - PACKAGE WAS CONVERTED TO STORED PROCEDURE BECAUSE IT IS BEING REUSED BY OTHER PACKAGES. **
+```
+
+Scan converted SQL files with:
+```bash
+grep -rn "!!!RESOLVE EWI!!!" <OUTPUT_DIR>/
+```
+
+For any code not in the table below, look up the full description in the public docs:
+- EWI codes: https://docs.snowflake.com/en/migrations/snowconvert-docs/general/technical-documentation/issues-and-troubleshooting/conversion-issues/ssisEWI
+- FDM codes: https://docs.snowflake.com/en/migrations/snowconvert-docs/general/technical-documentation/issues-and-troubleshooting/functional-difference/ssisFDM
+
+---
+
+### Control Flow EWI Codes
+
+| Code | Description | Fix Action |
+|------|-------------|------------|
+| `SSC-EWI-SSIS0001` | SSIS component not supported by SnowConvert | Full manual rewrite required. Identify the component type (ScriptTask, third-party, custom), read original C# from `.dtsx`, translate to Snowflake Scripting SP or JavaScript UDF |
+| `SSC-EWI-SSIS0004` | Control Flow element cannot be converted to Snowflake Scripting | Rewrite the element manually. For ScriptTask: read the original C# body and reimplement as a Snowflake Scripting block or JS SP. For unsupported containers: restructure logic using IF/ELSE + CALL pattern |
+| `SSC-EWI-SSIS0005` | ForEach Loop file enumerator type not supported | Use the ForEachLoop Python SP pattern — see `ForEachLoop File Enumerator` section below |
+| `SSC-EWI-SSIS0011` | Result binding configured for non-query statement | Remove result binding. For DDL/DML: use `EXECUTE IMMEDIATE`. For value capture: `LET v := (SELECT col FROM ...)` |
+| `SSC-EWI-SSIS0014` | ForEach File Enumerator folder path requires manual stage mapping | Replace the `<STAGE_PLACEHOLDER>` with the actual Snowflake stage path: `@<db>.<schema>.<stage>/folder/`. See ForEachLoop pattern |
+| `SSC-EWI-SSIS0019` | Script Task C# code not converted | Read the C# body from the original `.dtsx` file. Translate logic to Snowflake Scripting (SQL SP) or JavaScript SP. Common patterns: file validation → DIRECTORY query; string manipulation → Snowflake string functions; logging → INSERT into audit table |
+| `SSC-EWI-SSIS0025` | Flat File Source stage path variable requires manual mapping | Replace the stage path variable reference with a literal: `@<db>.<schema>.<stage>/path/filename.csv` or pass as SP argument |
+| `SSC-EWI-SSIS0026` | ForEach ADO.NET Schema Rowset Enumerator not supported | Replace with a `SHOW TABLES / INFORMATION_SCHEMA` query fed into a cursor loop |
+| `SSC-EWI-SSIS0037` | SSIS expression function not reviewed for Snowflake equivalence | Look up the specific function name in the comment. Common mappings: `REVERSE` → `REVERSE()`, `FINDSTRING` → `POSITION()` or `CHARINDEX()-1`, `SUBSTRING` → `SUBSTR()`, `UPPER/LOWER` → direct, `TRIM` → `TRIM()`, `LEN` → `LEN()`, `REPLACE` → `REPLACE()` |
+| `SSC-EWI-SSIS0039` | FileSystemTask overwrite=false not supported — Snowflake silently overwrites | Option A (strict): add a `LIST @stage WHERE name = '<file>'` check before COPY FILES and raise an exception if file exists. Option B (accepted): document the behaviour difference and remove the marker |
+| `SSC-EWI-SSIS0044` | FileSystemTask COPY FILES — destination treated as directory prefix, source filename appended | If the destination is intentionally a directory: no action needed. If a specific output filename is required: construct the full path explicitly in the COPY FILES call |
+
+---
+
+### Send Mail Task EWI/FDM Codes
+
+| Code | Description | Fix Action |
+|------|-------------|------------|
+| `SSC-EWI-SSIS0015` | SMTP connection manager not supported | Replace with Snowflake Notification Integration + `SYSTEM$SEND_EMAIL()`. See Send Mail Task pattern |
+| `SSC-EWI-SSIS0016` | Email priority setting ignored | Remove priority — no Snowflake equivalent; acceptable behaviour difference |
+| `SSC-EWI-SSIS0017` | Email attachment not supported | If attachment is required: write data to a stage file first, then share the stage URL in the email body |
+| `SSC-EWI-SSIS0018` | HTML email body not supported — plain text only | Convert HTML body to plain text. If formatting is critical, include a Snowsight URL link instead |
+| `SSC-FDM-SSIS0008` | FROM address prepended to email body (Snowflake cannot set FROM) | Informational — no code fix. The FROM field is fixed to the Notification Integration's configured sender |
+| `SSC-FDM-SSIS0009` | CC recipients merged into TO recipients | Informational — no code fix. All recipients (TO + CC) receive the same message |
+
+---
+
+### Bulk Insert Task EWI Codes
+
+| Code | Description | Fix Action |
+|------|-------------|------------|
+| `SSC-EWI-SSIS0020` | Native format not supported — must export to delimited first | Add a pre-step to export the source as CSV/Parquet to a stage, then use `COPY INTO` |
+| `SSC-EWI-SSIS0021` | LastRow parameter not supported | Load full file to a staging table, then filter target rows with `ROW_NUMBER() OVER (ORDER BY ...)` |
+| `SSC-EWI-SSIS0022` | FireTriggers not supported | Implement trigger-like logic with a Stream + Task on the destination table |
+| `SSC-EWI-SSIS0024` | Bulk Insert Task general conversion issue | Review the generated `COPY INTO` statement. Verify FILE_FORMAT options, stage path, and column mapping match the source file |
+
+---
+
+### General EWI Codes
+
+| Code | Description | Fix Action |
+|------|-------------|------------|
+| `SSC-EWI-0021` | SQL OUTPUT / OUTPUT INTO clause not supported in Snowflake | Replace with one of: `SELECT MAX(id)` before/after INSERT, `INSERT INTO ... SELECT NEXTVAL('seq')`, or a RETURNING workaround via a staging query |
+
+---
+
+### FDM Informational Codes (no code fix required — review only)
+
+| Code | Description | Action |
+|------|-------------|--------|
+| `SSC-FDM-SSIS0001` | Non-deterministic ordering — NULL in ORDER BY | Add explicit `ORDER BY` column(s). Use `NULLS FIRST` or `NULLS LAST` if needed |
+| `SSC-FDM-SSIS0005` | Package converted to stored procedure because it is reused by other packages | Informational — the generated SP structure is intentional. No change needed |
+| `SSC-FDM-SSIS0025` | Variable value must be a valid Snowflake stage path | Update the variable value or SP argument to use `@<db>.<schema>.<stage>/path/` format |
+| `SSC-FDM-SSIS0026` | CreateDirectory not supported — .dummy placeholder used | Informational — the `.dummy` file approach is the correct Snowflake equivalent. No change needed |
+
+---
+
 ## ForEachLoop File Enumerator → LIST + Cursor Pattern
 
 SnowConvert generates a `LIST @stage` + cursor pattern. When implementing manually with SPs, use DIRECTORY:
