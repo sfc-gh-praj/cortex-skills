@@ -285,15 +285,17 @@ After reviewing detected source/destination types in `ETL.Elements.csv`, annotat
 For each source with an available connector, add to `etl_assessment_summary.md`:
 > `"[Source Type] detected — Snowflake OpenFlow [connector] connector available. Evaluate for Phase 2 Source Ingestion strategy before writing custom ingest code."`
 
-**Log** Phase 1 to `migration_phase_tracking.md` with start datetime, end datetime, duration, and the following stats:
+**Log** Phase 1 to `migration_phase_tracking.md` with start datetime, end datetime, duration, and the following stats.
+
+> **Speed tip**: Read `<OUTPUT_DIR>/etl_assessment_analysis.json` — it contains all the data below. Use it directly instead of re-deriving from the CSVs.
 
 #### Phase 1 Required Stats in Tracking File
 
-1. **Package Analysis Results** — Table with columns: Package, Classification, Components (CF/DF), Effort (hrs), Key Findings
-2. **Connection Managers Identified** — Table with columns: Name, Type, Purpose
-3. **Unsupported Elements** — Numbered list of all components marked `NotSupported` or with critical EWI markers
-4. **Complexity Drivers** — Numbered list of the top complexity contributors (Script Components, loops, Script Tasks, etc.) with specific details
-5. **Assessment Output Files** — Table listing all generated artifacts with File, Path, and Size columns
+1. **Package Analysis Results** — Read from `etl_assessment_analysis.json` → `packages[]`. Build a table: Package, Classification, Components (CF/DF), Supported %, Effort (hrs), Complexity, Key Findings. Do not recompute — copy values from JSON.
+2. **Connection Managers Identified** — Table with columns: Name, Type, Purpose (read from `.dtsx` files or SnowConvert output)
+3. **Unsupported Elements** — Read from `etl_assessment_analysis.json` → filter `packages[].elements[]` where `Status == "NotSupported"`. List each as: Package → Subtype → Component name.
+4. **Complexity Drivers** — Read from `etl_assessment_analysis.json` → `packages[]` where `complexity` is `"High"` or `"Medium"`. List the specific subtypes driving complexity (ScriptTask, ForEachLoop, etc.).
+5. **Assessment Output Files** — Table listing all generated artifacts with File, Path, and Size columns (use `ls -lh <OUTPUT_DIR>/` output)
 
 **Only proceed to Phase 2 after assessment is complete.**
 
@@ -412,6 +414,28 @@ If user chose to use SnowConvert output, read all converted files:
 
 ### Step 3.3: Write MIGRATION_PLAN.md (MANDATORY)
 
+**First, check package complexity** from `etl_assessment_analysis.json`:
+
+```
+Low-complexity criteria (ALL must be true across every package):
+  • no package has complexity = "High" or "Medium"
+  • totals.not_supported = 0
+  • totals.ewi = 0  (or only informational EWIs with no manual action required)
+  • no ScriptTask or ScriptComponent in any package
+```
+
+#### If ALL packages are Low complexity → Condensed 5-Section Plan
+
+Write `<OUTPUT_DIR>/MIGRATION_PLAN.md` with these 5 sections only:
+
+1. **Executive Summary** — package count, component count, supported %, estimated effort, chosen approach
+2. **Package Mapping** — per-package table: SSIS Component → Snowflake Object (SP/Task/UDF/COPY INTO), one row per element
+3. **Implementation Approach** — chosen options from Phase 2 (orchestration, transforms, ingestion, file storage) with rationale
+4. **Issues & Manual Steps** — every EWI/FDM from `etl_assessment_analysis.json` → `all_issues[]`, with resolution action for each
+5. **Deployment Order** — numbered sequence of SQL scripts to run
+
+#### If ANY package is Medium or High complexity → Full 13-Section Plan
+
 **Load** `references/phase3_migration_plan_template.md` for the required 13-section structure.
 
 Write `<OUTPUT_DIR>/MIGRATION_PLAN.md` containing ALL 13 mandatory sections. Every EWI/FDM issue from the CSV must be individually listed (do NOT group or deduplicate).
@@ -519,7 +543,21 @@ Once OpenFlow is validated:
 
 ### Step 4.2: Generate Implementation Files
 
-Based on the MIGRATION_PLAN.md, generate all artifacts. The output structure depends on the project — a typical layout (adapt as needed):
+**First, determine the generation strategy** based on what SnowConvert produced:
+
+#### Strategy A — Adopt SnowConvert Output (default when SnowConvert SQL exists)
+
+> **Speed tip**: If SnowConvert converted SQL files exist (verified in Step 1.1), adopt them directly. Do NOT regenerate files that are already converted. Only write new files for gaps and apply targeted fixes for EWI/FDM markers.
+
+1. **Copy** SnowConvert-converted SQL files into `<OUTPUT_DIR>/implementation/sql/` with numbered prefixes
+2. **Open each file** and scan for EWI/FDM inline comment markers (e.g. `-- EWI: SSC-EWI-*`, `-- FDM: SSC-FDM-*`)
+3. **Fix only the marked sections** — apply targeted rewrites for each EWI/FDM using `references/snowflake_patterns.md`; leave all non-marked code untouched
+4. **Write new files only** for objects SnowConvert did not produce: orchestrator SP, Task DAG, file format (if missing), test data
+5. Log which files were adopted as-is, which were patched, and which were written from scratch in `solution_artifacts_generated.md`
+
+#### Strategy B — Generate from Scratch (only when no SnowConvert SQL exists, or user explicitly chose to start fresh)
+
+Based on the MIGRATION_PLAN.md, generate all artifacts from scratch. The output structure depends on the project — a typical layout (adapt as needed):
 
 ```
 <OUTPUT_DIR>/
@@ -553,7 +591,7 @@ Based on the MIGRATION_PLAN.md, generate all artifacts. The output structure dep
 - CreateDirectory → .dummy placeholder file
 - Data Flow Task → dbt project (`EXECUTE DBT PROJECT`) or SP inline SQL
 
-Write `<OUTPUT_DIR>/implementation/solution_artifacts_generated.md` listing all files with source attribution and EWI resolution mapping.
+Write `<OUTPUT_DIR>/implementation/solution_artifacts_generated.md` listing all files with source attribution (SnowConvert-adopted / patched / new) and EWI resolution mapping.
 
 ### Step 4.3: User Approval Gate (MANDATORY)
 
