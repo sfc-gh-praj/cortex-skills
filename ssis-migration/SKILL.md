@@ -322,10 +322,12 @@ For each source with an available connector, add to `etl_assessment_summary.md`:
 #### Data Flow Transformations
 | Option | Best For | Pros | Cons |
 |--------|----------|------|------|
-| dbt Models | Complex transforms, testing, lineage | Version control, testing framework | Requires dbt setup |
+| dbt Models | Complex transforms, testing, lineage | Version control, testing framework; **Snowflake-native** (runs inside Snowflake, no local install needed) | Deployed via `snow dbt deploy` + executed via `EXECUTE DBT PROJECT` |
 | Dynamic Tables | Continuous transforms, simple logic | Auto-refresh, declarative | Less flexible |
 | SP SQL | Simple transforms, tight coupling | Single deployment unit | Harder to test |
 | Hybrid | Mixed complexity | Best of both | More components |
+
+> **dbt default execution mode**: When dbt Models is selected, dbt is **always deployed to Snowflake as a native object** using `snow dbt deploy` and executed inside Snowflake via `EXECUTE DBT PROJECT`. Do **not** run dbt locally unless the customer explicitly requests local dbt CLI during Phase 1 or Phase 2.
 
 #### File Storage
 | Option | Best For |
@@ -576,6 +578,7 @@ Based on the MIGRATION_PLAN.md, generate all artifacts from scratch. The output 
 │   │   └── NN_run_test.sql
 │   ├── dbt_project/          (if dbt selected)
 │   │   ├── dbt_project.yml
+│   │   ├── profiles.yml      (⚠️ MUST NOT contain password/authenticator/token/private_key_path/env_var() — auth is handled by the Snowflake session)
 │   │   ├── models/
 │   │   ├── macros/
 │   │   ├── seeds/
@@ -586,7 +589,7 @@ Based on the MIGRATION_PLAN.md, generate all artifacts from scratch. The output 
 
 **Key implementation patterns** — refer to `references/snowflake_patterns.md`:
 - ForEachLoop → LIST + CURSOR or DIRECTORY(@stage) cursor
-- Script Component (C#) → JavaScript/SQL UDFs + lookup seed tables
+- Script Component (C#) → inline CASE expressions + Python or JavaScript UDFs (ask user preference) + seed table LEFT JOINs, all folded into the nearest downstream existing dbt model (do NOT create a new intermediate model)
 - Script Task (C#) → Snowflake Scripting (IF/THEN/RAISE)
 - SQL OUTPUT clause → sequence + NEXTVAL or MAX(id)
 - SSIS expressions (REVERSE, FINDSTRING) → SPLIT_PART
@@ -594,9 +597,164 @@ Based on the MIGRATION_PLAN.md, generate all artifacts from scratch. The output 
 - Send Mail Task → SYSTEM$SEND_EMAIL + Notification Integration
 - Bulk Insert Task → COPY INTO + inline FILE_FORMAT
 - CreateDirectory → .dummy placeholder file
-- Data Flow Task → dbt project (`EXECUTE DBT PROJECT`) or SP inline SQL
+- Data Flow Task → dbt project (deploy via `snow dbt deploy`, execute via `EXECUTE DBT PROJECT`) or SP inline SQL — **default is Snowflake-native dbt** unless customer explicitly chose local dbt CLI in Phase 2
 
 Write `<OUTPUT_DIR>/implementation/solution_artifacts_generated.md` listing all files with source attribution (SnowConvert-adopted / patched / new) and EWI resolution mapping.
+
+### Step 4.2b: Prepare and Deploy dbt Project to Snowflake (MANDATORY when dbt selected)
+
+> **Skip this step only if** the customer explicitly chose "Local dbt CLI" during Phase 1 or Phase 2.
+
+Snowflake-native dbt authenticates via the active Snowflake session. Before deploying, the `profiles.yml` **must** be stripped of any auth fields.
+
+**1. Migrate `profiles.yml`** — remove all of the following fields if present:
+
+```yaml
+# REMOVE these fields entirely — they are not valid for Snowflake-native dbt:
+# user, password, authenticator, token, private_key_path, private_key_passphrase
+# Also remove any env_var() calls in profiles.yml or dbt_project.yml vars
+```
+
+Correct minimal `profiles.yml` for Snowflake-native deployment:
+
+```yaml
+<profile_name>:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: <account_identifier>
+      role: <role>
+      database: <database>
+      warehouse: <warehouse>
+      schema: <schema>
+      threads: 4
+```
+
+Also replace any `env_var('KEY')` in `dbt_project.yml` vars with literal values or `{{ var('key') }}` patterns (values supplied at runtime via `ARGS='build --vars ...'`).
+
+**2. Deploy dbt project to Snowflake:**
+
+```bash
+snow dbt deploy <PROJECT_NAME> \
+  --source <path_to_dbt_project> \
+  --database <TARGET_DATABASE> \
+  --schema <TARGET_SCHEMA> \
+  --connection <CONNECTION_NAME>
+```
+
+**3. Verify deployment:**
+
+```bash
+snow dbt list --in schema <TARGET_SCHEMA> --database <TARGET_DATABASE> --connection <CONNECTION_NAME>
+```
+
+The deployed project appears as a Snowflake object at `<DATABASE>.<SCHEMA>.<PROJECT_NAME>`. It is executed by the orchestrator SP via `EXECUTE DBT PROJECT <DATABASE>.<SCHEMA>.<PROJECT_NAME> ARGS='build'`.
+
+**4.** Update `solution_artifacts_generated.md` to record the deployed dbt project object name.
+
+### Step 4.5: Post-SnowConvert dbt Validation Checklist (MANDATORY before Phase 5)
+
+> **Run this checklist on every SSIS migration that uses dbt**, regardless of project. These patterns are universal SnowConvert output issues that only surface at runtime with real data — they are undetectable by static SQL review or `snow dbt deploy`. Running this checklist reduces E2E debugging from 10+ SP call attempts to 1–2.
+
+#### A. Grep checks — run on every project
+
+**1. SSIS error output columns**
+```bash
+grep -rn "ErrorCode\|ErrorColumn\|Flat File Source Error Output Column" models/
+```
+Any model that **selects** these columns from another dbt model (not defining them as `NULL::INT AS ErrorCode`) must be rewritten. These are SSIS OLE DB/Flat File Destination error output port columns — they have no Snowflake equivalent.
+
+**Fix pattern** — replace the entire model body with a `WHERE FALSE` stub:
+```sql
+{{ config(materialized='view') }}
+SELECT
+    CAST(NULL AS INT)  AS ErrorCode,
+    CAST(NULL AS INT)  AS ErrorColumn,
+    -- ... other columns expected downstream ...
+WHERE FALSE
+```
+Apply the same fix to all downstream models that read those columns.
+
+**2. Zero-datetime numeric cast**
+```bash
+grep -rn "::NUMERIC = 0\|::NUMBER = 0\|CAST.*AS NUMBER.*= 0" models/
+```
+SnowConvert translates SSIS's uninitialized DateTime value (`0`) as a numeric comparison on a timestamp column. Snowflake cannot cast `TIMESTAMP_NTZ` to `NUMERIC`.
+
+**Fix:** Replace `IFF((col)::NUMERIC = 0, NULL::TIMESTAMP_NTZ, col)` with `IFF(col IS NULL, NULL::TIMESTAMP_NTZ, col)`
+
+**3. Ephemeral materialization with pre-hooks**
+```bash
+grep -rn "ephemeral" dbt_project.yml models/
+```
+If any model uses `materialized='ephemeral'` AND other models reference it in `pre_hook` SQL (e.g., `m_update_row_count_variable`), change it to `view`. Ephemeral CTEs only exist within the single SQL statement that runs the model — pre-hook SQL runs separately and cannot see them.
+
+**Fix:** In `dbt_project.yml`, change all `+materialized: ephemeral` under `intermediate:` to `+materialized: view`.
+
+**4. `COMMENT` clause in Python SP DDL**
+```bash
+grep -n "COMMENT" sql/11_create_sp*.sql sql/*process_files*.sql 2>/dev/null
+```
+SnowConvert generates `CREATE PROCEDURE ... COMMENT = '...'` at a position the Snowflake Python SP DDL parser rejects.
+
+**Fix:** Remove the `COMMENT = '...'` line from any Python SP `CREATE OR REPLACE PROCEDURE` DDL.
+
+#### B. Manual checks — verify against actual source data
+
+**5. VARCHAR widths**
+
+Check staging model column widths against actual sample data:
+
+| Column | Common SSIS metadata width | Actual width | Risk |
+|--------|--------------------------|--------------|------|
+| IMEI | `DT_STR(14)` | **15 digits** | Always wrong |
+| MSISDN / phone | `DT_STR(10)` | Up to 15 | Often wrong |
+| event_type / type codes | `DT_STR(1)` | 2–3 chars | Common |
+| description fields | `DT_STR(50)` | 100–255 | Check source |
+
+**Fix:** Query the stage directly with `SELECT $N FROM @stage (FILE_FORMAT => ...)` and measure max `LEN($N)` per column before setting `::VARCHAR(N)` casts.
+
+**6. File format SKIP_HEADER and record delimiter**
+
+```sql
+SHOW FILE FORMATS LIKE '<format_name>' IN SCHEMA <db>.<schema>;
+```
+
+Verify:
+- `SKIP_HEADER` = **1** if the CSV has a header row (almost always true)
+- `RECORD_DELIMITER` matches actual file line endings:
+  - Windows CRLF files: `\r\n` (but test with `\n` if `MULTI_LINE=true` causes issues)
+  - Unix LF files: `\n`
+  - `MULTI_LINE=true` combined with `\r` delimiter can cause the entire file to parse as one row
+
+**Quick test:** Run `SELECT $1, $2, ... FROM @stage/file.csv (FILE_FORMAT => ...) LIMIT 5` without type casts. If the first row is the header, add `SKIP_HEADER=1`. If `$7` contains `\n` followed by the next row's first field, the record delimiter is wrong.
+
+**7. profiles.yml — no auth fields**
+
+```bash
+grep -n "user:\|password:\|authenticator:\|token:\|private_key\|env_var" dbt_project/profiles.yml
+```
+
+Snowflake-native dbt (`snow dbt deploy`) auth is handled by the Snowflake session — **no user/password/token/authenticator fields are allowed**. Remove any of these lines.
+
+Valid `profiles.yml` contains only: `type`, `account`, `role`, `database`, `warehouse`, `schema`, `threads`.
+
+#### C. Summary table
+
+| Check | Command | Fix if found |
+|-------|---------|-------------|
+| SSIS error columns in SELECT | `grep -rn "ErrorCode\|ErrorColumn" models/` | Replace model body with `WHERE FALSE` stub |
+| Zero-datetime numeric cast | `grep -rn "::NUMERIC = 0"` | Change to `IS NULL` check |
+| Ephemeral + pre-hooks | `grep -rn "ephemeral" dbt_project.yml` | Change to `view` |
+| COMMENT in Python SP DDL | `grep -n "COMMENT" sql/*sp*.sql` | Remove line |
+| VARCHAR widths | Query stage with `$N` positional cols | Fix widths to match actual data |
+| SKIP_HEADER=0 on header CSV | `SHOW FILE FORMATS` | Set `SKIP_HEADER=1`, fix `RECORD_DELIMITER` |
+| Auth fields in profiles.yml | `grep "user:\|password:\|token:"` | Remove those lines |
+
+> Completing this checklist before Step 5 (E2E testing) is the single highest-ROI action in an SSIS migration. It converts a 10+ iteration debugging loop into a 1–2 attempt first run.
+
+---
 
 ### Step 4.3: User Approval Gate (MANDATORY)
 
@@ -641,6 +799,8 @@ Execute SQL scripts in numbered order using `snowflake_sql_execute`. Fix any dep
 - VARCHAR length mismatches → verify source data lengths against actual data
 
 ### Step 5.2: Upload Test Data & Run SP Test
+
+> **When dbt is selected (Snowflake-native)**: The orchestrator SP calls `EXECUTE DBT PROJECT` internally. The dbt project **must** have been deployed in Step 4.2b before this test will succeed. If deployment was skipped, run `snow dbt deploy` now before calling the SP.
 
 1. Upload test CSV files to source stage
 2. Run the master orchestrator SP directly via `CALL sp_orchestrator()` (or equivalent)
@@ -767,3 +927,5 @@ Complete SSIS-to-Snowflake migration including:
 | DIRECTORY(@stage) shows stale data | Use `LIST @stage` for accurate results; `ALTER STAGE REFRESH` for directory metadata |
 | COMMENT on TASK syntax error | Remove COMMENT clause — some task configurations don't support it |
 | Task cron won't fire immediately | Use `EXECUTE TASK <root>` for on-demand triggering instead of waiting for schedule |
+| `snow dbt deploy` fails — `profiles.yml` has auth fields | Remove `password`, `authenticator`, `token`, `private_key_path`, and all `env_var()` calls from `profiles.yml` — Snowflake-native dbt authenticates via the active session |
+| `snow dbt deploy` fails — `env_var()` in `dbt_project.yml` | Replace `env_var('KEY')` with literal values or `{{ var('key') }}` in models; supply values at runtime via `ARGS='build --vars {"key":"value"}'` in `EXECUTE DBT PROJECT` |
