@@ -12,7 +12,7 @@ End-to-end migration of SSIS packages to Snowflake using SnowConvert output. Fol
 ## Prerequisites
 
 - SnowConvert has already been run on the SSIS packages (user pre-requisite)
-- Access to Cortex Code with `snowconvert-assessment` skill
+- Python 3.9+ available locally (used by the bundled assessment script)
 - Snowflake account with appropriate permissions
 - `.dtsx` package files available locally
 
@@ -24,7 +24,7 @@ End-to-end migration of SSIS packages to Snowflake using SnowConvert output. Fol
 ## Workflow Overview
 
 ```
-Phase 1: Assessment (snowconvert-assessment skill)
+Phase 1: Assessment (bundled generate_ssis_report.py script)
   ↓
 Phase 2: Migration Planning (user selects approach)
   ↓  ⚠️ STOP
@@ -231,13 +231,33 @@ Also check SnowConvert output path for: converted SQL, dbt project, file formats
 
 ### Step 1.2: Run ETL Assessment (MANDATORY)
 
-**Invoke** the `snowconvert-assessment` skill to generate:
-- `etl_assessment_analysis.json` — Structured assessment data
-- `ssis_assessment_report.html` — Interactive HTML report
-- `dags/` — Control Flow and Data Flow DAG visualizations
-- `ai_ssis_summary.html` — AI-generated summary
+**Locate the SnowConvert ETL report CSVs** in the user's SnowConvert output directory. They are placed under `Reports/SnowConvert/` inside the conversion output folder:
 
-After assessment, generate `etl_assessment_summary.md` from the JSON.
+```bash
+find <SNOWCONVERT_OUTPUT_DIR> -name "ETL.Elements*.csv" | head -1
+find <SNOWCONVERT_OUTPUT_DIR> -name "ETL.Issues*.csv"   | head -1
+```
+
+If the CSVs are not found, ask the user for the SnowConvert output directory. If SnowConvert has not been run yet, document components manually from the `.dtsx` files and skip to Step 1.3.
+
+**Run the bundled assessment script** (requires Python 3.9+, no external packages):
+
+```bash
+python3 ~/.snowflake/cortex/skills/ssis-migration/scripts/generate_ssis_report.py \
+    --elements /path/to/ETL.Elements.<timestamp>.csv \
+    --issues   /path/to/ETL.Issues.<timestamp>.csv \
+    --output   <OUTPUT_DIR>/
+```
+
+Where `<OUTPUT_DIR>` is the migration review folder (e.g. `ssis_migration_review/`).
+
+**This generates:**
+- `ssis_assessment_report.html` — Interactive HTML report with component breakdown, EWI/FDM issues, and per-package drill-down
+- `packages/package_<Name>.html` — Per-package detail pages
+- `etl_assessment_summary.md` — Markdown summary; copy its content directly into `migration_phase_tracking.md`
+- `etl_assessment_analysis.json` — Structured data for downstream use
+
+After running, display the output paths to the user.
 
 ### Step 1.3: Review Assessment Output
 
