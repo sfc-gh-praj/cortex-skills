@@ -25,35 +25,48 @@ FOR file_row IN file_cursor DO
 END FOR;
 ```
 
-**SP-based style (DIRECTORY):**
-```sql
+**SP-based style — Python SP (DIRECTORY, recommended):**
+
+> **WARNING**: SQL Scripting cursor record field access (`rec.RELATIVE_PATH`) fails
+> at **compile time** with `invalid identifier 'REC.RELATIVE_PATH'` when the cursor
+> source is a table function like `DIRECTORY(@stage)`. Use a Python SP instead.
+
+```python
 CREATE OR REPLACE PROCEDURE sp_process_files()
-RETURNS VARCHAR LANGUAGE SQL EXECUTE AS CALLER AS $$
-DECLARE
-    v_file_path VARCHAR;
-    v_file_name VARCHAR;
-    c1 CURSOR FOR
-        SELECT RELATIVE_PATH
-        FROM DIRECTORY(@source_stage)
-        WHERE RELATIVE_PATH LIKE '%.csv'
-        ORDER BY RELATIVE_PATH;
-BEGIN
-    ALTER STAGE source_stage REFRESH;
-    OPEN c1;
-    FOR rec IN c1 DO
-        v_file_path := rec.RELATIVE_PATH;
-        v_file_name := SPLIT_PART(v_file_path, '/', -1);
-        -- Per-file processing here
-    END FOR;
-    CLOSE c1;
-    RETURN 'SUCCESS';
-END; $$;
+RETURNS VARIANT
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.11'
+PACKAGES = ('snowflake-snowpark-python')
+HANDLER = 'run'
+AS
+$$
+def run(session):
+    session.sql("ALTER STAGE source_stage REFRESH").collect()
+
+    files = session.sql(
+        "SELECT RELATIVE_PATH "
+        "FROM DIRECTORY(@source_stage) "
+        "WHERE RELATIVE_PATH ILIKE '%.csv' "
+        "ORDER BY RELATIVE_PATH"
+    ).collect()
+
+    files_processed = 0
+    for row in files:
+        # Escape single quotes in path (defensive — stage paths are trusted)
+        safe_path = row['RELATIVE_PATH'].replace("'", "''")
+        session.sql(f"CALL PUBLIC.sp_process_file('{safe_path}')").collect()
+        files_processed += 1
+
+    return {"status": "success", "files_processed": files_processed}
+$$;
 ```
 
 **Key points:**
 - Always `ALTER STAGE REFRESH` before reading DIRECTORY
-- Stage must have `DIRECTORY = (ENABLE = TRUE)`
+- Stage must have `DIRECTORY = (ENABLE = TRUE)`: `ALTER STAGE s SET DIRECTORY = (ENABLE = TRUE)`
 - `RELATIVE_PATH` includes subdirectory prefixes (e.g., `batch_0/file.csv`)
+- Python SP requires a warehouse — ensure the Task or caller specifies one
+- Replace `@source_stage` and `sp_process_file` with actual names post-migration
 - Replace `<STAGE_PLACEHOLDER>` with actual stage name post-migration
 
 ## Dynamic Stage Path in CTAS (avoiding bind variable issues)
@@ -129,6 +142,39 @@ END;
 
 **Prerequisites**: `CREATE INTEGRATION ON ACCOUNT` grant; all recipients must be verified in Snowflake.
 
+## CR-only Line Endings (\r — old Mac format)
+
+Source CSV files created on older Mac systems or certain ETL tools may use CR-only
+(`\r`) line terminators instead of `\n` or `\r\n`. Snowflake's default file format
+expects `\n` or `\r\n` — **CR-only files return 0 rows silently** with no error.
+
+```sql
+-- Diagnose: if COPY INTO or a stage query returns 0 rows on a non-empty file,
+-- check line endings with: xxd source_file.csv | head -3
+-- CR-only shows: 0d (hex) at end of each field block with no 0a
+
+CREATE OR REPLACE FILE FORMAT telecom_csv_format
+    TYPE             = CSV
+    FIELD_DELIMITER  = '|'
+    RECORD_DELIMITER = '\r'    -- required for CR-only (\r) files
+    SKIP_HEADER      = 1
+    NULL_IF          = ('', 'NULL');
+
+-- For \r\n files (Windows): RECORD_DELIMITER = '\r\n'  (Snowflake default)
+-- For \n files (Unix/Linux): RECORD_DELIMITER = '\n'   (also default)
+-- For \r files (old Mac):    RECORD_DELIMITER = '\r'   <-- must set explicitly
+```
+
+**Tip:** Verify before creating the format:
+```sql
+SELECT $1, $2, $3
+FROM @source_stage/sample_file.csv
+    (FILE_FORMAT => (TYPE=CSV FIELD_DELIMITER='|' RECORD_DELIMITER='\r' SKIP_HEADER=1))
+LIMIT 5;
+```
+
+---
+
 ## Bulk Insert Task → COPY INTO (EWI SSC-EWI-SSIS0024)
 
 SnowConvert converts Bulk Insert Tasks to `COPY INTO` with inline FILE_FORMAT:
@@ -192,6 +238,38 @@ SELECT src.*,
 FROM source_table src
 LEFT JOIN lookup_table lk ON src.code = lk.code;
 ```
+
+## Raising Custom Exceptions in Snowflake Scripting
+
+> **WARNING**: `RAISE EXCEPTION 'message'` is **not valid** Snowflake Scripting syntax
+> and causes a SQL compilation error. You must declare a named exception first.
+
+```sql
+-- WRONG — causes: SQL compilation error: syntax error ... unexpected 'message'
+IF (:v_count = 0) THEN
+    RAISE EXCEPTION 'Reference table is empty';
+END IF;
+
+-- CORRECT — declare a named exception in the DECLARE block, then raise it
+DECLARE
+    v_count     INT;
+    empty_ref   EXCEPTION (-20001, 'Reference table is empty. Load data before running ETL.');
+BEGIN
+    SELECT COUNT(*) INTO :v_count FROM PUBLIC.dim_reference;
+    IF (:v_count = 0) THEN
+        RAISE empty_ref;
+    END IF;
+    -- ...
+END;
+```
+
+**Rules:**
+- Exception code must be in range `-20000` to `-20999` (user-defined range)
+- Each named exception needs a unique code within the procedure
+- Multiple exceptions can be declared in the same `DECLARE` block
+- Caught via `EXCEPTION WHEN OTHER THEN` (Snowflake does not support named WHEN clauses)
+
+---
 
 ## Validation SP Pattern (replaces SSIS setup/validation package)
 
@@ -282,7 +360,31 @@ CREATE OR REPLACE TASK task_process
     AFTER task_validate
 AS CALL sp_process_files();
 
--- Enable: ALTER TASK task_root RESUME;
+-- Enable: child tasks first, then root
+-- ALTER TASK task_process RESUME;
+-- ALTER TASK task_validate RESUME;
+-- ALTER TASK task_root RESUME;
+```
+
+> **WARNING**: Do NOT use non-ASCII characters (em dashes `—`, smart quotes `""`,
+> accented letters, etc.) in `COMMENT` clauses on `CREATE TASK`. They cause a
+> SQL compilation error: `syntax error ... unexpected 'COMMENT'`.
+> Use plain ASCII only in all COMMENT strings.
+
+```sql
+-- WRONG — em dash causes compile error
+CREATE OR REPLACE TASK task_process
+    WAREHOUSE = WH_NAME
+    AFTER task_root
+    COMMENT = 'Loads files — mirrors Data_Load.dtsx'   -- em dash breaks this
+AS CALL sp_process_files();
+
+-- CORRECT — plain ASCII only
+CREATE OR REPLACE TASK task_process
+    WAREHOUSE = WH_NAME
+    AFTER task_root
+    COMMENT = 'Loads files - mirrors Data_Load.dtsx'   -- hyphen is fine
+AS CALL sp_process_files();
 ```
 
 ## Stream + Task Pattern (replaces SSIS trigger-like behavior)

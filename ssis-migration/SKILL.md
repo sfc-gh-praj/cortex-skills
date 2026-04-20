@@ -37,6 +37,39 @@ Phase 5: Validation & Testing (deploy + E2E test)
 DONE
 ```
 
+## Progress Reporting (MANDATORY)
+
+At the **start of every phase** and at every **⚠️ MANDATORY STOPPING POINT**,
+output a progress banner to the user in this exact format:
+
+```
+---
+📍 Phase N of 5 — <Phase Name>
+Progress: [████████░░░░░░░░░░░░] X%
+Status: <In Progress | Awaiting User Input | Complete>
+---
+```
+
+**Phase progress thresholds:**
+
+| Milestone | % | Banner |
+|---|---|---|
+| Phase 1 started | 5% | `[█░░░░░░░░░░░░░░░░░░░]` |
+| Phase 1 complete | 20% | `[████░░░░░░░░░░░░░░░░]` |
+| Phase 2 started | 25% | `[█████░░░░░░░░░░░░░░░]` |
+| Phase 2 complete | 35% | `[███████░░░░░░░░░░░░░]` |
+| Phase 3 started | 40% | `[████████░░░░░░░░░░░░]` |
+| Phase 3 complete | 55% | `[███████████░░░░░░░░░]` |
+| Phase 4 started | 60% | `[████████████░░░░░░░░]` |
+| Phase 4 complete | 80% | `[████████████████░░░░]` |
+| Phase 5 started | 85% | `[█████████████████░░░]` |
+| Phase 5 complete | 100% | `[████████████████████]` |
+
+At every stopping point where user input is awaited, include:
+```
+⚠️  WAITING FOR YOUR INPUT — migration is paused until you respond.
+```
+
 **CRITICAL**: Create `<OUTPUT_DIR>/migration_phase_tracking.md` at the start of Phase 1. It MUST begin with a project header:
 
 ```
@@ -170,9 +203,14 @@ If significant technical decisions were made during migration, include a table:
 
 ## Phase 1: Assessment
 
+> **ANNOUNCE PROGRESS** — output banner: Phase 1 of 5 — Assessment | `[█░░░░░░░░░░░░░░░░░░░]` 5% | Status: In Progress
+
 ### Step 1.0: Gather Required Paths (MANDATORY FIRST)
 
 **⚠️ MANDATORY STOPPING POINT**: Collect ALL paths before any analysis.
+
+> **ANNOUNCE PROGRESS** — output banner: Phase 1 of 5 — Assessment | `[█░░░░░░░░░░░░░░░░░░░]` 5% | Status: Awaiting User Input
+> ⚠️ WAITING FOR YOUR INPUT — migration is paused until you respond.
 
 Ask user for:
 1. **SSIS source path** — Where are the `.dtsx` files?
@@ -243,9 +281,14 @@ For each source with an available connector, add to `etl_assessment_summary.md`:
 
 ## Phase 2: Migration Planning
 
+> **ANNOUNCE PROGRESS** — output banner: Phase 2 of 5 — Migration Planning | `[████░░░░░░░░░░░░░░░░]` 20% | Status: In Progress
+
 ### Step 2.1: Present Implementation Options
 
 **⚠️ MANDATORY STOPPING POINT**: Collect user selections for each category.
+
+> **ANNOUNCE PROGRESS** — output banner: Phase 2 of 5 — Migration Planning | `[█████░░░░░░░░░░░░░░░]` 25% | Status: Awaiting User Input
+> ⚠️ WAITING FOR YOUR INPUT — migration is paused until you respond.
 
 #### Control Flow Orchestration
 | Option | Best For | Pros | Cons |
@@ -330,6 +373,8 @@ Record all selections. **Log** Phase 2 to `migration_phase_tracking.md` with sta
 
 ## Phase 3: Detailed Mapping & Migration Plan
 
+> **ANNOUNCE PROGRESS** — output banner: Phase 3 of 5 — Detailed Mapping | `[███████░░░░░░░░░░░░░]` 35% | Status: In Progress
+
 ### Step 3.1: DAG Review
 
 Read all DAGs under `<OUTPUT_DIR>/dags/`. Analyze:
@@ -355,6 +400,9 @@ Write `<OUTPUT_DIR>/MIGRATION_PLAN.md` containing ALL 13 mandatory sections. Eve
 
 **⚠️ MANDATORY STOPPING POINT**: Phase 4 MUST NOT begin until user explicitly approves the plan.
 
+> **ANNOUNCE PROGRESS** — output banner: Phase 3 of 5 — Detailed Mapping | `[███████████░░░░░░░░░]` 55% | Status: Awaiting User Input
+> ⚠️ WAITING FOR YOUR INPUT — review MIGRATION_PLAN.md and confirm before Phase 4 begins.
+
 1. Tell user the plan location
 2. Ask user to review
 3. Wait for explicit approval ("approved", "looks good", "go ahead")
@@ -371,6 +419,8 @@ Write `<OUTPUT_DIR>/MIGRATION_PLAN.md` containing ALL 13 mandatory sections. Eve
 ---
 
 ## Phase 4: Implementation
+
+> **ANNOUNCE PROGRESS** — output banner: Phase 4 of 5 — Implementation | `[████████████░░░░░░░░]` 60% | Status: In Progress
 
 ### Step 4.1: Gather Target Details
 
@@ -489,6 +539,9 @@ Write `<OUTPUT_DIR>/implementation/solution_artifacts_generated.md` listing all 
 
 **⚠️ MANDATORY STOPPING POINT**: Phase 5 MUST NOT begin until user explicitly approves the generated implementation code.
 
+> **ANNOUNCE PROGRESS** — output banner: Phase 4 of 5 — Implementation | `[████████████████░░░░]` 80% | Status: Awaiting User Input
+> ⚠️ WAITING FOR YOUR INPUT — review all generated scripts before any deployment begins.
+
 1. Present a summary of all generated files (SQL scripts, dbt models, UDFs, SPs, test data) with:
    - File count by category (SQL, dbt, test data, docs)
    - Which files are SC-as-is, modified, fully rewritten, or new
@@ -511,6 +564,8 @@ Write `<OUTPUT_DIR>/implementation/solution_artifacts_generated.md` listing all 
 ---
 
 ## Phase 5: Validation & Testing
+
+> **ANNOUNCE PROGRESS** — output banner: Phase 5 of 5 — Validation & Testing | `[█████████████████░░░]` 85% | Status: In Progress
 
 ### Step 5.1: Deploy to Snowflake
 
@@ -605,6 +660,9 @@ Write `<OUTPUT_DIR>/Solution_End_End_Testing.md` with:
 6. **Task DAG Testing** (if tasks were created) — Task name, schedule, action, state, manual execution test result, task history verification
 7. **Deployed Snowflake Objects Summary** — Table with columns: Object Type, Name, Status (every object created: databases, schemas, stages, file formats, tables, UDFs, SPs, tasks)
 8. **Migration Timeline Summary** — Table with columns: Phase, Status, Key Output (one row per phase for a final rollup view)
+
+> **ANNOUNCE PROGRESS** — output banner: Phase 5 of 5 — Validation & Testing | `[████████████████████]` 100% | Status: Complete
+> Migration is complete. All phases done — hand off `Solution_End_End_Testing.md` and `migration_phase_tracking.md` to stakeholders.
 
 ---
 
