@@ -751,6 +751,40 @@ Valid `profiles.yml` contains only: `type`, `account`, `role`, `database`, `ware
 | VARCHAR widths | Query stage with `$N` positional cols | Fix widths to match actual data |
 | SKIP_HEADER=0 on header CSV | `SHOW FILE FORMATS` | Set `SKIP_HEADER=1`, fix `RECORD_DELIMITER` |
 | Auth fields in profiles.yml | `grep "user:\|password:\|token:"` | Remove those lines |
+| dbt seed JOIN type safety | `grep -rn "LEFT JOIN.*_map\|JOIN.*_mapping" models/` | Cast seed column to VARCHAR (see check 8 below) |
+| IDENTITY columns on dbt tables | `grep -rn "IDENTITY\|AUTOINCREMENT" sql/*tables*.sql` | Remove IDENTITY from dbt-managed tables (see check 9 below) |
+
+**8. dbt seed column type safety in JOIN conditions**
+
+dbt auto-infers numeric-looking seed columns as `NUMBER(38,0)`. Any JOIN where a `VARCHAR`-derived expression (e.g. `SUBSTR(col, 1, 5)`) is compared against such a column will fail for non-numeric inputs — Snowflake casts the VARCHAR to NUMBER.
+
+```bash
+grep -rn "LEFT JOIN.*tac_\|LEFT JOIN.*lac_\|JOIN.*_mapping" models/
+```
+
+**Fix:** Cast seed columns to `::VARCHAR` in JOIN conditions:
+```sql
+-- Unsafe — fails for non-numeric IMEI values like 'INVALID_IMEI_XX'
+ON SUBSTR(p.tac, 1, 5) = t.tac_prefix
+-- Safe
+ON SUBSTR(p.tac, 1, 5) = t.tac_prefix::VARCHAR AND LENGTH(t.tac_prefix::VARCHAR) = 5
+```
+
+Apply this to every seed JOIN where the left-hand side comes from a stage-read VARCHAR column.
+
+**9. IDENTITY columns on dbt-managed tables**
+
+dbt incremental models introspect the target table schema at run time. An `IDENTITY` (autoincrement) column named `id` causes dbt to attempt `SELECT id FROM <staging_view>` — which fails because the staging view does not expose `id`.
+
+```bash
+grep -rn "IDENTITY\|AUTOINCREMENT" sql/*tables*.sql
+```
+
+**Fix:** Remove `IDENTITY`/`AUTOINCREMENT` from every table that dbt writes to. Generate surrogate keys via a sequence `NEXTVAL` in the orchestrator SP instead:
+```sql
+-- In the SP, before calling dbt:
+LET audit_id INT := TELECOM_ETL.PUBLIC.SEQ_AUDIT_ID.NEXTVAL;
+```
 
 > Completing this checklist before Step 5 (E2E testing) is the single highest-ROI action in an SSIS migration. It converts a 10+ iteration debugging loop into a 1–2 attempt first run.
 
@@ -831,6 +865,7 @@ If the migration includes Snowflake Tasks (SSIS scheduled execution equivalent),
    ))
    ORDER BY SCHEDULED_TIME DESC LIMIT 5;
    ```
+   > **Note**: `TASK_HISTORY` shows the task's next scheduled cron run (STATE = `SCHEDULED`) — not the immediate EXECUTE TASK trigger. If STATE = `SCHEDULED` with a future timestamp, do not wait for it. Instead, verify execution via the audit table (e.g. `SELECT * FROM dim_audit ORDER BY id DESC LIMIT 3`) — a new row with the current timestamp confirms the task ran successfully.
 6. **Validate results**: Confirm new batch in `dim_audit`, rows inserted in target tables, files moved to processed stage
 7. **Suspend tasks** after testing to avoid unintended scheduled runs:
    ```sql
@@ -924,7 +959,10 @@ Complete SSIS-to-Snowflake migration including:
 | Bulk Insert — native format not supported | Export source data to CSV before migration |
 | ForEach non-file enumerators not supported | Implement manually using Snowflake queries/scripting |
 | Task child not triggered after EXECUTE | Resume child tasks before root: `ALTER TASK <child> RESUME` first |
-| DIRECTORY(@stage) shows stale data | Use `LIST @stage` for accurate results; `ALTER STAGE REFRESH` for directory metadata |
+| DIRECTORY(@stage) shows stale data after PUT | Directory metadata not refreshed | `ALTER STAGE <stage> REFRESH` after every PUT — required before any SP or query that reads from `DIRECTORY()` |
+| `LIST @stage` shows file but `SELECT $1 FROM @stage` returns 0 rows | Stage storage inaccessible (stale stage object, e.g. after database recreate) | `DROP STAGE`, recreate with `DIRECTORY=TRUE`, re-PUT file, then `ALTER STAGE REFRESH` |
+| dbt build fails — "Numeric value 'XXXX' is not recognized" on seed JOIN | Seed column auto-typed as `NUMBER(38,0)`; `VARCHAR`-derived JOIN expression forces implicit cast for non-numeric inputs | Cast seed column in JOIN: `ON SUBSTR(col, 1, 5) = seed_col::VARCHAR` (see Step 4.5 check 8) |
+| `snow sql -q` returns truncated or empty results for multi-statement query | `-q` truncates multi-statement output above ~4k chars | Use `snow sql -f <file.sql>` for any query with multiple statements or large output |
 | COMMENT on TASK syntax error | Remove COMMENT clause — some task configurations don't support it |
 | Task cron won't fire immediately | Use `EXECUTE TASK <root>` for on-demand triggering instead of waiting for schedule |
 | `snow dbt deploy` fails — `profiles.yml` has auth fields | Remove `password`, `authenticator`, `token`, `private_key_path`, and all `env_var()` calls from `profiles.yml` — Snowflake-native dbt authenticates via the active session |
