@@ -440,10 +440,33 @@ def parse_bim(bim_path: str) -> dict:
         print("  Use SSMS to upgrade or export to JSON format.", file=sys.stderr)
         sys.exit(1)
 
-    # model.bim: top-level "model" key (compat 1200+) or model directly at root
-    model = raw.get("model") or raw
+    # Resolve the model object and compatibility level from three possible structures:
+    #
+    #  Structure A (SSMS XMLA / VS create script):
+    #    { "create": { "database": { "compatibilityLevel": 1500, "model": { ... } } } }
+    #
+    #  Structure B (older .bim with top-level "model" key):
+    #    { "model": { ... } }
+    #
+    #  Structure C (model dict directly at root):
+    #    { "tables": [...], "relationships": [...], ... }
 
-    compat_level = raw.get("compatibilityLevel", model.get("compatibilityLevel", 0))
+    database = raw.get("create", {}).get("database", {})
+    if database.get("model"):
+        # Structure A
+        model        = database["model"]
+        compat_level = database.get("compatibilityLevel", model.get("compatibilityLevel", 0))
+        model_name   = database.get("name", path.stem)
+    elif raw.get("model"):
+        # Structure B
+        model        = raw["model"]
+        compat_level = raw.get("compatibilityLevel", model.get("compatibilityLevel", 0))
+        model_name   = raw.get("name", path.stem)
+    else:
+        # Structure C — model is the root object itself
+        model        = raw
+        compat_level = raw.get("compatibilityLevel", 0)
+        model_name   = raw.get("name", path.stem)
     try:
         compat_int = int(str(compat_level))
     except (ValueError, TypeError):
@@ -463,7 +486,7 @@ def parse_bim(bim_path: str) -> dict:
     perspectives  = [parse_perspective(p) for p in model.get("perspectives", [])]
 
     inventory = {
-        "model_name":     raw.get("name", path.stem),
+        "model_name":     model_name,
         "compatibility_level": compat_level,
         "default_power_bi_data_source_version": model.get("defaultPowerBIDataSourceVersion"),
         "tables":         tables,
