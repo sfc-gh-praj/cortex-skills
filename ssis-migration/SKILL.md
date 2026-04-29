@@ -11,31 +11,93 @@ End-to-end migration of SSIS packages to Snowflake using SnowConvert output. Fol
 
 ## Prerequisites
 
-- SnowConvert has already been run on the SSIS packages (user pre-requisite)
+- `.dtsx` package files available locally
 - Python 3.9+ available locally (used by the bundled assessment script)
 - Snowflake account with appropriate permissions
-- `.dtsx` package files available locally
+- SnowConvert output is **optional** — the skill supports both "start from scratch" (manual `.dtsx` analysis) and "use SnowConvert output" paths
 
 ## Setup
 
 1. **Load** `references/component_mapping_reference.md` — SSIS-to-Snowflake component mapping patterns
 2. **Load** `references/snowflake_patterns.md` — Snowflake implementation patterns for common SSIS constructs
 
+## Sub-Skill References
+
+The dbt TDD Fix Loop (Phase 4, Step 4.4) delegates to sub-skills from the `migrate-etl-package` skill.
+Resolve `MEP_SKILL_DIR` at runtime — do NOT hardcode the path:
+
+```bash
+MEP_SKILL_DIR=$(find ~/.snowflake/cortex/remote-cache \
+  -path "*/migrate-objects/actions/migrate-etl-package" \
+  -maxdepth 8 -type d 2>/dev/null | head -1)
+```
+
+| Constant | Path | Used In |
+|----------|------|---------|
+| `DBT_TEST_GEN_SKILL` | `$MEP_SKILL_DIR/dbt-test-gen/SKILL.md` | Phase 4 Step 4.4 |
+| `DBT_FIXER_SKILL` | `$MEP_SKILL_DIR/dbt-fixer/SKILL.md` | Phase 4 Step 4.4 |
+| `TRACK_STATUS_PY` | `$MEP_SKILL_DIR/scripts/track_status.py` | Phase 4 Step 4.4, Phase Gate |
+| `SSIS_PLATFORM_DIR` | `$MEP_SKILL_DIR/platforms/ssis` | Phase 4 Step 4.4 |
+| `TRANSFORMATION_GUIDE` | `$MEP_SKILL_DIR/platforms/ssis/dataflow-guide.md` | Phase 4 Step 4.4 |
+
+If `MEP_SKILL_DIR` resolves to empty, the dbt TDD Fix Loop cannot run — inform the user and fall back to manual EWI scanning (Step 4.5).
+
+## Agent Wait Protocol
+
+**NEVER use `bash sleep`, `bash_output`, or `cortex agent output` to wait for agents.**
+
+1. Spawn all parallel agents in a **single message** (multiple parallel tool calls in one response)
+2. **End your turn** — do not narrate, loop, or call additional tools while waiting
+3. Automatic task notifications arrive when each background agent finishes — process each notification as it arrives
+4. After all notifications arrive, verify output files exist on disk before continuing to the next step
+
+This protocol applies to both the dbt-test-gen wave and the dbt-fixer wave in Step 4.4.
+
+## Phase Gate Enforcement
+
+A machine-readable gate must pass before Phase 5 begins. After completing Step 4.4, run:
+
+```bash
+uv run --project $MEP_SKILL_DIR python $TRACK_STATUS_PY \
+  validate-phase <OUTPUT_DIR>/.ssis-dbt-tracking/session_status.json 4
+```
+
+**Gate passes when**: every dbt node has a terminal status (`test-passed`, `fixed`, `no-fix-needed`, `skipped`, `failed`, `needs-user`). Zero nodes in `pending` or `dbt-tested`.
+
+**Gate fails**: report the blocking nodes to the user. Do NOT proceed to Phase 5 until they are resolved or the user explicitly accepts them as `needs-user`.
+
+For resumability, create `STATE.md` at Phase 1 start:
+
+```bash
+mkdir -p <OUTPUT_DIR>/.ssis-dbt-tracking
+uv run --project $MEP_SKILL_DIR python $TRACK_STATUS_PY \
+  update-state <OUTPUT_DIR>/.ssis-dbt-tracking/session_status.json \
+  --current-phase 1 --phase-status "In Progress" \
+  --next-action "Phase 1: Assessment"
+```
+
+On re-entry, check for `<OUTPUT_DIR>/.ssis-dbt-tracking/session_status.json` — if it exists, read it to resume from the correct step rather than restarting from Phase 1.
+
 ## Workflow Overview
 
 ```
 Phase 1: Assessment (bundled generate_ssis_report.py script)
-  ↓
+  ↓  LOG Phase 1 → migration_phase_tracking.md
 Phase 2: Migration Planning (user selects approach)
+  ↓  LOG Phase 2 → migration_phase_tracking.md  ← MUST happen before Phase 3
   ↓  ⚠️ STOP
 Phase 3: Detailed Mapping → MIGRATION_PLAN.md (13 sections)
+  ↓  LOG Phase 3 → migration_phase_tracking.md  ← MUST happen before Phase 4
   ↓  ⚠️ STOP — user must approve plan
 Phase 4: Implementation (generate all SQL/dbt files)
+  ↓  LOG Phase 4 → migration_phase_tracking.md  ← MUST happen before Phase 5
   ↓  ⚠️ STOP — user must approve generated scripts before any deployment
 Phase 5: Validation & Testing (deploy + E2E test)
-  ↓  LOG to migration_phase_tracking.md
+  ↓  LOG Phase 5 → migration_phase_tracking.md
 DONE
 ```
+
+> **CRITICAL LOGGING RULE**: Each phase MUST be logged to `migration_phase_tracking.md` **immediately when that phase completes** — before any user STOP and before moving to the next phase. Do NOT defer or batch phase logging to the end of the run.
 
 ## Progress Reporting (MANDATORY)
 
@@ -61,6 +123,9 @@ Status: <In Progress | Awaiting User Input | Complete>
 | Phase 3 started | 40% | `[████████░░░░░░░░░░░░]` |
 | Phase 3 complete | 55% | `[███████████░░░░░░░░░]` |
 | Phase 4 started | 60% | `[████████████░░░░░░░░]` |
+| Phase 4 dbt test-gen wave started | 65% | `[█████████████░░░░░░░]` |
+| Phase 4 dbt fix wave started | 70% | `[██████████████░░░░░░]` |
+| Phase 4 dbt TDD complete | 75% | `[███████████████░░░░░]` |
 | Phase 4 complete | 80% | `[████████████████░░░░]` |
 | Phase 5 started | 85% | `[█████████████████░░░]` |
 | Phase 5 complete | 100% | `[████████████████████]` |
@@ -207,19 +272,72 @@ If significant technical decisions were made during migration, include a table:
 
 ### Step 1.0: Gather Required Paths (MANDATORY FIRST)
 
-**⚠️ MANDATORY STOPPING POINT**: Collect ALL paths before any analysis.
+**⚠️ MANDATORY STOPPING POINT**: You MUST collect ALL answers before doing any file reading, directory listing, or analysis. Do NOT skip or infer any answer. Do NOT proceed to Step 1.1 until every question below has been explicitly answered by the user.
 
 > **ANNOUNCE PROGRESS** — output banner: Phase 1 of 5 — Assessment | `[█░░░░░░░░░░░░░░░░░░░]` 5% | Status: Awaiting User Input
 > ⚠️ WAITING FOR YOUR INPUT — migration is paused until you respond.
 
-Ask user for:
-1. **SSIS source path** — Where are the `.dtsx` files?
-2. **SnowConvert CSV path** — Where are `ETL.Elements.csv` and `ETL.Issues.csv`? (typically `Reports/SnowConvert/`)
-3. **SnowConvert output path** — Converted SQL/dbt output (typically `Output/SnowConvert/`). Ask if user wants to use SnowConvert output or start from scratch.
-4. **Assessment output path** — Where to place results (e.g., `ssis_migration_review/`)
-5. **Target Snowflake database name** — The database to create/use for this migration (e.g., `TELECOM_ETL`). Used in all DDLs, `profiles.yml`, and Task definitions.
-6. **Target Snowflake schema name** — The schema to use within the target database. Defaults to `PUBLIC` if not specified.
-7. **Snowflake warehouse name** — The existing warehouse to use for queries, dbt runs, and Snowflake Tasks (e.g., `COMPUTE_WH`). Must already exist in the account.
+**REQUIRED**: Use the `AskUserQuestion` tool to collect answers. Do NOT ask these as plain text — they must be asked via the tool so the user can respond structured. Ask all questions in a **single `AskUserQuestion` call** (up to 4 at a time). If more than 4 questions are needed, ask in two batches — wait for the first batch response before asking the second.
+
+#### Batch 1 — SnowConvert availability + SSIS source + output path
+
+Ask these 3 questions together:
+
+1. **SnowConvert availability** (header: "SnowConvert", multiSelect: false)
+   - Question: "Has SnowConvert AI already been run on these SSIS packages?"
+   - Option A: "Yes, SnowConvert output exists" — SC has been run and output (converted SQL/dbt files, ETL CSVs) is available
+   - Option B: "No — start from scratch" — SC has NOT been run; manual analysis from .dtsx files only
+
+2. **SSIS source path** (header: "SSIS source", multiSelect: false) — only if NOT already provided in the user's message
+   - Question: "Where are the .dtsx package files located? (provide full path)"
+   - Offer reasonable defaults based on any path already mentioned in the conversation
+   - If the user already provided the SSIS path in their initial message, skip this question and use the provided path.
+
+3. **Assessment output path** (header: "Output path", multiSelect: false)
+   - Question: "Where should all migration output files (assessment report, migration plan, generated SQL/dbt) be placed?"
+   - Offer 2–3 reasonable path suggestions derived from the SSIS source path (e.g., a sibling folder named `ssis_migration_output`)
+
+#### Batch 2 — SnowConvert paths (CONDITIONAL on Batch 1 answer) + Snowflake target details
+
+After receiving Batch 1 answers, ask Batch 2. Include the SnowConvert path questions ONLY if the user answered "Yes, SnowConvert output exists" in Batch 1. Always include the Snowflake target questions.
+
+4. **SnowConvert CSV path** (header: "CSV path", multiSelect: false) — **ONLY if SnowConvert output exists**
+   - Question: "Where are ETL.Elements.csv and ETL.Issues.csv located? (typically inside Reports/SnowConvert/ within the SnowConvert output folder)"
+   - If the user answers "N/A" or leaves blank, treat as no CSVs available and fall back to manual analysis.
+
+5. **SnowConvert output path** (header: "SC output path", multiSelect: false) — **ONLY if SnowConvert output exists**
+   - Question: "Where is the converted SQL/dbt output folder from SnowConvert? (typically Output/SnowConvert/ inside the SnowConvert output folder)"
+
+6. **Target Snowflake database name** (header: "Target DB", multiSelect: false)
+   - Question: "What Snowflake database name should be used as the migration target? (used in all DDLs, profiles.yml, and Task definitions)"
+   - Offer 2–3 suggestions derived from the SSIS project name
+
+7. **Target Snowflake schema name** (header: "Target schema", multiSelect: false)
+   - Question: "What Snowflake schema should be used within the target database?"
+   - Suggest: PUBLIC, and one domain-specific option derived from the project
+
+8. **Snowflake warehouse name** (header: "Warehouse", multiSelect: false)
+   - Question: "Which Snowflake warehouse should be used for queries, dbt runs, and Snowflake Task execution? (must already exist in the account)"
+   - Suggest: COMPUTE_WH and 1–2 other common names
+
+**ENFORCEMENT RULES**:
+- Do NOT start reading `.dtsx` files until Step 1.0 is fully complete.
+- Do NOT assume SnowConvert output exists or doesn't exist — always ask.
+- Do NOT skip the SnowConvert CSV/output path questions if the user said "Yes, SnowConvert output exists."
+- If the user provides a path that doesn't exist on disk, verify with `ls` and ask them to correct it before continuing.
+- Record all collected values in a summary block before proceeding:
+
+```
+## Step 1.0 — Collected Inputs
+- SSIS source path: <value>
+- SnowConvert available: Yes / No
+- SnowConvert CSV path: <value or N/A>
+- SnowConvert output path: <value or N/A>
+- Assessment output path: <value>
+- Target database: <value>
+- Target schema: <value>
+- Snowflake warehouse: <value>
+```
 
 ### Step 1.1: Verify SnowConvert Output
 
@@ -307,10 +425,7 @@ For each source with an available connector, add to `etl_assessment_summary.md`:
 
 ### Step 2.1: Present Implementation Options
 
-**⚠️ MANDATORY STOPPING POINT**: Collect user selections for each category.
-
-> **ANNOUNCE PROGRESS** — output banner: Phase 2 of 5 — Migration Planning | `[█████░░░░░░░░░░░░░░░]` 25% | Status: Awaiting User Input
-> ⚠️ WAITING FOR YOUR INPUT — migration is paused until you respond.
+Present all option tables below to the user, then stop and wait for their selections.
 
 #### Control Flow Orchestration
 | Option | Best For | Pros | Cons |
@@ -386,7 +501,12 @@ For each source with an available connector, add to `etl_assessment_summary.md`:
 - **SQL*Plus/JDBC incremental extract** → CSV/Parquet → S3/ADLS → COPY INTO — near-CDC via high watermark, misses DELETEs
 - **Oracle Data Pump export** → S3/ADLS → COPY INTO — batch only, simplest to implement
 
-Record all selections. **Log** Phase 2 to `migration_phase_tracking.md` with start datetime, end datetime, duration, and the following stats:
+**⚠️ MANDATORY STOPPING POINT**: All options above have been presented. Collect user selections for each category.
+
+> **ANNOUNCE PROGRESS** — output banner: Phase 2 of 5 — Migration Planning | `[█████░░░░░░░░░░░░░░░]` 25% | Status: Awaiting User Input
+> ⚠️ WAITING FOR YOUR INPUT — migration is paused until you respond.
+
+Record all selections. **Immediately log Phase 2 to `migration_phase_tracking.md`** (do NOT defer this — log Phase 2 before moving to Phase 3) with start datetime, end datetime, duration, and the following stats:
 
 #### Phase 2 Required Stats in Tracking File
 
@@ -449,10 +569,20 @@ Write `<OUTPUT_DIR>/MIGRATION_PLAN.md` containing ALL 13 mandatory sections. Eve
 > **ANNOUNCE PROGRESS** — output banner: Phase 3 of 5 — Detailed Mapping | `[███████████░░░░░░░░░]` 55% | Status: Awaiting User Input
 > ⚠️ WAITING FOR YOUR INPUT — review MIGRATION_PLAN.md and confirm before Phase 4 begins.
 
-1. Tell user the plan location
-2. Ask user to review
-3. Wait for explicit approval ("approved", "looks good", "go ahead")
-4. If changes requested, update and repeat
+**REQUIRED**: Use the `AskUserQuestion` tool to collect approval. Do NOT accept a plain text acknowledgment as approval — it must go through the tool.
+
+Ask the following question via `AskUserQuestion`:
+
+- **Header**: "Plan Review"
+- **Question**: "Please review `MIGRATION_PLAN.md` at `<OUTPUT_DIR>/MIGRATION_PLAN.md`. It contains all 13 sections including DAG diagrams, component mappings, EWI resolutions, script rewrites, and open decisions. Are you ready to approve and begin Phase 4 implementation?"
+- **Option A**: "Approved — proceed with Phase 4 implementation"
+- **Option B**: "Changes needed — I'll describe what to fix" (if selected, ask follow-up for the change description, update plan, and re-ask)
+- **Option C**: "Pause — I need more time to review"  (if selected, run `cortex ctx task pause` and stop)
+
+**ENFORCEMENT RULES**:
+- Do NOT start Phase 4 if the user selects "Changes needed" — update `MIGRATION_PLAN.md` and re-present.
+- Do NOT start Phase 4 if the user selects "Pause" — pause the task and wait.
+- Only proceed when "Approved" is explicitly selected.
 
 **Log** Phase 3 (including approval status) to `migration_phase_tracking.md` with start datetime, end datetime, duration, and the following stats:
 
@@ -470,10 +600,12 @@ Write `<OUTPUT_DIR>/MIGRATION_PLAN.md` containing ALL 13 mandatory sections. Eve
 
 ### Step 4.1: Gather Target Details
 
-Confirm with user:
+Confirm with user (if not already collected in Phase 1):
 - Target Database/Schema
-- Snowflake Connection name
+- **Snowflake SQL Connection name** — this is used for ALL `sql_execute` calls in Phase 5. Record it as `<CONNECTION_NAME>` (e.g., `COCO_JK`). Pass it explicitly to every `sql_execute` call via the `connection` parameter.
 - Warehouse name
+
+> **CONNECTION RULE**: Every `sql_execute` call throughout Phase 5 MUST include `connection=<CONNECTION_NAME>`. Never rely on the default active connection — always pass the user-confirmed name explicitly.
 
 ### Step 4.1a: OpenFlow Connector Deployment (Conditional — only when OpenFlow was selected in Phase 2 for Source Ingestion or CDC)
 
@@ -601,6 +733,33 @@ Based on the MIGRATION_PLAN.md, generate all artifacts from scratch. The output 
 
 Write `<OUTPUT_DIR>/implementation/solution_artifacts_generated.md` listing all files with source attribution (SnowConvert-adopted / patched / new) and EWI resolution mapping.
 
+### Step 4.2a: Parallel SQL Generation for Multi-Package Projects (when ≥ 3 SSIS packages)
+
+When the migration includes **3 or more SSIS packages** that each produce independent SQL scripts (e.g., separate orchestrator SPs, separate staging tables, separate file format scripts), spawn **one `general-purpose` background agent per package** to generate or patch that package's files in parallel. Each agent operates on an isolated subdirectory.
+
+**When to use this step**: Only when packages produce independent output files with no shared state. If packages share a single orchestrator SP or a single database schema, generate sequentially in Step 4.2 instead.
+
+**Spawn pattern**:
+```
+For each package <pkg_name> in packages (index 0..N-1):
+  Spawn background general-purpose agent with:
+  - Task: Generate/patch SQL files for SSIS package <pkg_name>
+  - Input: MIGRATION_PLAN.md, SnowConvert output for <pkg_name>, references/snowflake_patterns.md
+  - Output dir: <OUTPUT_DIR>/implementation/sql/<pkg_name>/
+  - Instruction: apply Strategy A (or B if no SC output), write numbered scripts,
+                 resolve all !!!RESOLVE EWI!!! markers, write pkg_artifacts_<pkg_name>.md
+  - Max agents per wave: 5
+```
+
+**Agent Wait Protocol**: End your turn after spawning. Do not proceed until all agents return.
+
+After all agents return:
+1. Validate each agent produced `pkg_artifacts_<pkg_name>.md` (artifact manifest)
+2. Merge all pkg_artifacts files into the top-level `solution_artifacts_generated.md`
+3. Check for naming conflicts (duplicate table names, duplicate stage names across packages) — resolve before proceeding
+
+**Constraint**: `snow dbt deploy` and SQL script deployment in Phase 5 remain sequential — this parallelism applies to **generation only**, not deployment.
+
 ### Step 4.2b: Prepare and Deploy dbt Project to Snowflake (MANDATORY when dbt selected)
 
 > **Skip this step only if** the customer explicitly chose "Local dbt CLI" during Phase 1 or Phase 2.
@@ -611,7 +770,8 @@ Snowflake-native dbt authenticates via the active Snowflake session. Before depl
 
 ```yaml
 # REMOVE these fields entirely — they are not valid for Snowflake-native dbt:
-# user, password, authenticator, token, private_key_path, private_key_passphrase
+# user, password, token, private_key_path, private_key_passphrase
+# authenticator: externalbrowser  ← remove this; replace with authenticator: oauth (see below)
 # Also remove any env_var() calls in profiles.yml or dbt_project.yml vars
 ```
 
@@ -623,13 +783,16 @@ Correct minimal `profiles.yml` for Snowflake-native deployment:
   outputs:
     dev:
       type: snowflake
-      account: <account_identifier>
+      account: <account_identifier>   # required — update per deployment environment
+      authenticator: oauth             # required — inherits session user at EXECUTE DBT PROJECT runtime
       role: <role>
       database: <database>
       warehouse: <warehouse>
       schema: <schema>
       threads: 4
 ```
+
+> **Why `authenticator: oauth`**: `snow dbt deploy` validates `profiles.yml` before packaging. At `EXECUTE DBT PROJECT` runtime, dbt runs inside Snowflake's execution environment where browser-based auth (`externalbrowser`) is not available. `oauth` tells the dbt adapter to use the current session's OAuth token. Omitting `authenticator` entirely may also work on some versions, but `oauth` is the explicit, safe choice. Do **not** use `externalbrowser`, `username_password_mfa`, or any user/password combination.
 
 Also replace any `env_var('KEY')` in `dbt_project.yml` vars with literal values or `{{ var('key') }}` patterns (values supplied at runtime via `ARGS='build --vars ...'`).
 
@@ -652,6 +815,217 @@ snow dbt list --in schema <TARGET_SCHEMA> --database <TARGET_DATABASE> --connect
 The deployed project appears as a Snowflake object at `<DATABASE>.<SCHEMA>.<PROJECT_NAME>`. It is executed by the orchestrator SP via `EXECUTE DBT PROJECT <DATABASE>.<SCHEMA>.<PROJECT_NAME> ARGS='build'`.
 
 **4.** Update `solution_artifacts_generated.md` to record the deployed dbt project object name.
+
+### Step 4.3: dbt Seed Type Safety (MANDATORY when dbt project exists)
+
+Before running the dbt TDD Fix Loop, ensure every seed CSV has explicitly declared column types in `dbt_project.yml`. This prevents silent `dbt seed` type mismatch errors — dbt auto-infers numeric-looking values as `NUMBER(38,0)`, causing JOIN failures when a `VARCHAR`-derived expression is compared to that column.
+
+**Rules — always declare explicit `+column_types` for these patterns:**
+
+| CSV column pattern | Required `+column_types` value |
+|---|---|
+| Date values (`YYYY-MM-DD`) | `date` |
+| Timestamps | `timestamp_ntz` |
+| JSON / nested structures | `variant` |
+| `true` / `false` | `boolean` |
+| Large integers (>9 digits) | `bigint` |
+| Mixed numeric/string (TAC, IMEI prefixes, codes) | `varchar` |
+
+**Template — add to every `dbt_project.yml` when seeds exist:**
+
+```yaml
+seeds:
+  <project_name>:
+    "<seed_folder_name>":
+      +schema: "{{ target.schema }}"
+      +tags: ["migrate_etl_package_test"]
+      +column_types:
+        <date_col>: date
+        <timestamp_col>: timestamp_ntz
+        <json_col>: variant
+        <prefix_col>: varchar       # prevents NUMBER cast in JOIN conditions
+```
+
+**Verification — run before proceeding to Step 4.4:**
+
+```bash
+grep -rn "column_types\|+schema:" <DBT_PROJECT_PATH>/dbt_project.yml
+```
+
+If `column_types` is absent and the seed CSV contains any of the above column patterns, add the block now. Do not skip — type mismatches surface as cryptic runtime errors during `dbt seed`, not as compilation errors.
+
+---
+
+### Step 4.4: dbt TDD Fix Loop (MANDATORY when dbt project exists)
+
+Replaces manual EWI marker scanning for dbt models. Runs `dbt-test-gen` then `dbt-fixer` for each dbt project generated in Step 4.2, fixing compilation errors and EWI markers iteratively (up to 5 attempts per node) before any deployment.
+
+> **Skip this step only if** no `dbt_project.yml` was generated in Step 4.2, OR if `MEP_SKILL_DIR` could not be resolved (fall back to Step 4.5 manual validation only).
+
+#### Step 4.4.0: Detect dbt Projects and Resolve MEP_SKILL_DIR
+
+```bash
+find <OUTPUT_DIR>/implementation -name "dbt_project.yml" 2>/dev/null
+```
+
+If nothing found: skip to Step 4.5.
+
+```bash
+MEP_SKILL_DIR=$(find ~/.snowflake/cortex/remote-cache \
+  -path "*/migrate-objects/actions/migrate-etl-package" \
+  -maxdepth 8 -type d 2>/dev/null | head -1)
+echo "MEP_SKILL_DIR=$MEP_SKILL_DIR"
+```
+
+If empty: warn the user and skip to Step 4.5 manual validation.
+
+#### Step 4.4.1: Initialize Tracking
+
+```bash
+mkdir -p <OUTPUT_DIR>/.ssis-dbt-tracking
+```
+
+Register each dbt project — **sequential, one call per project**:
+
+```bash
+uv run --project $MEP_SKILL_DIR python $TRACK_STATUS_PY \
+  init-dbt <OUTPUT_DIR>/.ssis-dbt-tracking/session_status.json \
+  <project_name> <dbt_project_path>
+```
+
+#### Step 4.4.2: dbt-Test-Gen Wave (parallel)
+
+Use `team_create` tool: `team_name="ssis-dbt-tdd-<package_name>"`.
+
+Spawn **one `general-purpose` background agent per dbt project** — **unconditional, no exceptions**. The agent handles broken projects (placeholder config, broken macros, missing sources) internally and documents all blockers in `test_report.md`. Early exit without test artifacts is a protocol violation.
+
+For each project spawn with `run_in_background=true`:
+- Instruction: Read `$DBT_TEST_GEN_SKILL` Task Mode section
+- Context: `project_path=<DBT_PROJECT_PATH>`, `source_file=<DTSX_FILE_PATH>`, `transformation_guide=$TRANSFORMATION_GUIDE`, `session_status_json=<OUTPUT_DIR>/.ssis-dbt-tracking/session_status.json`, `ROADMAP_path=<OUTPUT_DIR>/.ssis-dbt-tracking/ROADMAP.md`
+
+**Max 5 agents per wave.** If >5 projects: spawn first 5, follow Agent Wait Protocol, then spawn remaining.
+
+**Follow the Agent Wait Protocol: end your turn immediately after spawning. Do NOT issue further tool calls.**
+
+After notifications arrive — **validate ALL of these for EACH project**:
+- `<OUTPUT_DIR>/.migrate-etl-package/tests/dbt/<project>/seeds/` — at least 1 `.csv`
+- `<OUTPUT_DIR>/.migrate-etl-package/tests/dbt/<project>/tests/` — at least 1 `.sql`
+- `<OUTPUT_DIR>/.migrate-etl-package/tests/dbt/<project>/test_report.md` — must exist
+
+If ANY artifact is missing: respawn that project's agent (max 2 retries). After 2 retries: mark project nodes `failed` with reason `test-gen-exhaustion`.
+
+Update tracking — **sequential, one call per project**:
+
+```bash
+uv run --project $MEP_SKILL_DIR python $TRACK_STATUS_PY \
+  update-dbt <OUTPUT_DIR>/.ssis-dbt-tracking/session_status.json \
+  <project_name> --status dbt-tested
+```
+
+#### Step 4.4.3: Wave Checkpoint
+
+Before spawning fix agents, re-verify:
+1. Re-read `session_status.json` — confirm ALL projects have status `dbt-tested`
+2. Glob `seeds/*.csv` and `tests/*.sql` for each project — confirm counts > 0
+3. If any project is still `pending`: do NOT proceed — respawn its test-gen agent
+
+#### Step 4.4.3b: Pre-apply Known Fixes from fix_log (MANDATORY before spawning fix agents)
+
+Before spawning any fix agent, check whether `fix_log.md` already contains patterns matching the current project's file type or error class. Apply known fixes **before** first deployment — not after the first failure.
+
+```bash
+# Check if fix_log has any SQL/SP entries relevant to this project
+grep -i "SQL/SP Fix\|LIST.*PATTERN\|COPY FILES\|IDENTITY\|ErrorCode\|ErrorColumn" \
+  <OUTPUT_DIR>/.ssis-dbt-tracking/fix_log.md
+```
+
+For each matching SQL/SP fix entry:
+1. Identify which files in `implementation/sql/` match the "Pre-apply to" field
+2. Apply the fix to those files **now**, before the fix agent runs
+3. Log applied fixes in the agent instruction so the agent knows not to re-apply
+
+**Why this matters**: Without pre-application, the fix agent deploys, hits the known error, diagnoses it, and re-applies the fix — adding an unnecessary round trip. Pre-applying converts a reactive loop into a proactive pass.
+
+#### Step 4.4.4: dbt-Fix Wave (parallel)
+
+Spawn **one `general-purpose` background agent per project** that has ANY of:
+- Failing tests (test-failed nodes in `test_report.md`)
+- Compilation errors (documented in `test_report.md` `bootstrap_status`)
+- `!!!RESOLVE EWI!!!` markers in dbt model or macro files
+
+**For projects where ALL nodes passed and NO compilation errors**: no agent needed. Write a minimal file:
+
+```
+<OUTPUT_DIR>/.ssis-dbt-tracking/dbt_learnings_<project_name>.md
+content: "## no-fix-needed\nAll nodes passed baseline. No fixes required."
+```
+
+For each project needing fixes, spawn with `run_in_background=true`:
+- Instruction: Read `$DBT_FIXER_SKILL` Task Mode section
+- Context: same as test-gen + `test_report_path=<OUTPUT_DIR>/.migrate-etl-package/tests/dbt/<project>/test_report.md`, `original_backup_path=<OUTPUT_DIR>/.migrate-etl-package/original/`
+
+**Max 5 agents per wave.** Follow Agent Wait Protocol: end your turn after spawning.
+
+After notifications arrive — **validate**:
+- `<OUTPUT_DIR>/.ssis-dbt-tracking/dbt_learnings_<project_name>.md` exists for EVERY project
+
+Update tracking — **sequential**:
+
+```bash
+# Per node:
+uv run --project $MEP_SKILL_DIR python $TRACK_STATUS_PY \
+  update-dbt-node <OUTPUT_DIR>/.ssis-dbt-tracking/session_status.json \
+  <project_name> <node_name> --status <fixed|failed|skipped>
+
+# Per project:
+uv run --project $MEP_SKILL_DIR python $TRACK_STATUS_PY \
+  update-dbt <OUTPUT_DIR>/.ssis-dbt-tracking/session_status.json \
+  <project_name> --status dbt-fixed
+```
+
+#### Step 4.4.5: Merge Learnings
+
+Read all `<OUTPUT_DIR>/.ssis-dbt-tracking/dbt_learnings_*.md`. Append new patterns (no duplicates) to `<OUTPUT_DIR>/.ssis-dbt-tracking/fix_log.md`.
+
+**Also capture SQL/SP fix patterns** — any fix applied to a stored procedure, setup SQL, or data load SQL during this phase must be recorded in `fix_log.md` so subsequent files receive the same fix pre-applied rather than failing first.
+
+Format for SQL/SP entries:
+
+```markdown
+## SQL/SP Fix: <short title>
+- **File(s) affected**: `implementation/sql/<filename>.sql`
+- **Root cause**: <one sentence>
+- **Symptom**: <what failed or returned wrong results>
+- **Fix**: <exact change made>
+- **Pre-apply to**: any SP that uses `<pattern>` — apply fix before first deployment
+
+### Example
+## SQL/SP Fix: LIST stage PATTERN depth mismatch after COPY FILES
+- **File(s) affected**: `12_setup_sp.sql`, `13_data_load_sp.sql`
+- **Root cause**: COPY FILES flattens subdirectory paths to stage root
+- **Symptom**: LIST @stage PATTERN = '.*/.*\\.csv' returns 0 rows; pipeline processes 0 files
+- **Fix**: Change PATTERN = '.*/.*\\.csv' → PATTERN = '.*\\.csv'
+- **Pre-apply to**: any SP that LISTs a stage after COPY FILES restore
+```
+
+#### Step 4.4.6: Phase Gate (MANDATORY)
+
+```bash
+uv run --project $MEP_SKILL_DIR python $TRACK_STATUS_PY \
+  validate-phase <OUTPUT_DIR>/.ssis-dbt-tracking/session_status.json 4
+```
+
+**⚠️ Do NOT proceed to Step 4.5 if this gate fails.** Report any blocking nodes to the user with their failure reason. The user may explicitly mark a node `needs-user` to allow forward progress.
+
+#### Step 4.4.7: Shutdown Team
+
+Send `shutdown_request` to each agent → wait for `shutdown_response` notifications → call `team_delete`.
+
+**Log the dbt TDD Fix Loop outcome to `migration_phase_tracking.md`:**
+- Projects processed, nodes fixed vs failed
+- Fix log: `<OUTPUT_DIR>/.ssis-dbt-tracking/fix_log.md`
+
+---
 
 ### Step 4.5: Post-SnowConvert dbt Validation Checklist (MANDATORY before Phase 5)
 
@@ -753,6 +1127,7 @@ Valid `profiles.yml` contains only: `type`, `account`, `role`, `database`, `ware
 | Auth fields in profiles.yml | `grep "user:\|password:\|token:"` | Remove those lines |
 | dbt seed JOIN type safety | `grep -rn "LEFT JOIN.*_map\|JOIN.*_mapping" models/` | Cast seed column to VARCHAR (see check 8 below) |
 | IDENTITY columns on dbt tables | `grep -rn "IDENTITY\|AUTOINCREMENT" sql/*tables*.sql` | Remove IDENTITY from dbt-managed tables (see check 9 below) |
+| LIST @stage PATTERN uses `.*/.*` | `grep -rn "LIST @" sql/*.sql` | Replace `.*/.*\\.csv` with `.*\\.csv` (see check 10 below) |
 
 **8. dbt seed column type safety in JOIN conditions**
 
@@ -788,25 +1163,112 @@ LET audit_id INT := TELECOM_ETL.PUBLIC.SEQ_AUDIT_ID.NEXTVAL;
 
 > Completing this checklist before Step 5 (E2E testing) is the single highest-ROI action in an SSIS migration. It converts a 10+ iteration debugging loop into a 1–2 attempt first run.
 
+**10. LIST @stage PATTERN — use depth-independent regex**
+
+Stored procedures that loop over stage files commonly use:
+
+```bash
+grep -rn "LIST @" sql/*.sql
+```
+
+Look for any pattern containing `.*/.*` (requires subdirectory separator):
+```sql
+LIST @stage PATTERN = '.*/.*\\.csv';  -- FRAGILE: matches 'dir/file.csv' but NOT 'file.csv'
+```
+
+This pattern fails silently when files are at the stage root — `RESULT_SCAN` returns 0 rows, the ForEachLoop cursor processes nothing, and no error is raised.
+
+**When this occurs**: `COPY FILES` used to restore files from a processed stage does **not** preserve subdirectory paths. Files originally at `batch_0/file.csv` land at `file.csv` (stage root) after `COPY FILES INTO @source_stg/`.
+
+**Fix:** Replace all `.*/.*\\.csv` patterns with `.*\\.csv` — matches files at any depth:
+```sql
+LIST @stage PATTERN = '.*\\.csv';    -- SAFE: matches root-level and subdir files
+```
+
+Apply this fix to every SP that iterates over stage files using `LIST` + `RESULT_SCAN`.
+
 ---
 
-### Step 4.3: User Approval Gate (MANDATORY)
+### Step 4.5b: Generate Project-Specific rerun_reset.sql (MANDATORY)
+
+After completing the validation checklist, generate `<OUTPUT_DIR>/implementation/sql/rerun_reset.sql` populated with the **actual** object names discovered during migration. This file is the runnable reset script for E2E re-testing — it replaces the generic Step 5.4 template with project-specific SQL.
+
+The agent must substitute all placeholders using values from `MIGRATION_PLAN.md` and the generated SQL scripts:
+
+```sql
+-- ============================================================
+-- rerun_reset.sql  — generated by ssis-migration skill
+-- Purpose: Reset pipeline state for a clean E2E re-run
+-- Run IN ORDER. Skipping any step causes 0-row runs.
+-- ============================================================
+
+-- 1. Restore source files from processed stage
+--    (COPY FILES flattens paths — files land at stage root, not in subdirs)
+COPY FILES INTO @<actual_source_stage>/
+  FROM @<actual_processed_stage>/;
+
+-- 2. Refresh directory metadata (MANDATORY after COPY FILES)
+ALTER STAGE <actual_source_stage> REFRESH;
+
+-- 3. Truncate target tables
+TRUNCATE TABLE <actual_database>.<actual_schema>.<fact_table>;
+TRUNCATE TABLE <actual_database>.<actual_schema>.<audit_table>;
+
+-- 4. Reset batch counter
+UPDATE <actual_database>.<actual_schema>.<control_table>
+SET VARIABLE_VALUE = TO_VARIANT(0)
+WHERE VARIABLE_NAME = '<batch_id_variable_name>'
+  AND VARIABLE_SCOPE = '<batch_id_scope>';
+
+-- 5. Trigger pipeline
+EXECUTE TASK <actual_database>.<actual_schema>.<root_task_name>;
+```
+
+**How to populate the placeholders:**
+| Placeholder | Where to find it |
+|---|---|
+| `<actual_source_stage>` | Stage created in setup SQL (grep `CREATE STAGE` in sql/) |
+| `<actual_processed_stage>` | Stage for processed files (grep `processed` in setup SQL) |
+| `<fact_table>` | Main insert target (grep `INSERT INTO` in data_load SP) |
+| `<audit_table>` | Audit/log table (grep `DIM_AUDIT\|audit` in SP) |
+| `<control_table>` | Control variable table (grep `CONTROL_VARIABLES\|control` in SP) |
+| `<batch_id_variable_name>` | Variable name in control table (grep `batch_id\|User_batch` in SP) |
+| `<root_task_name>` | Root task (grep `CREATE TASK.*SCHEDULE\|EXECUTE TASK` in tasks SQL) |
+
+Write this file to `implementation/sql/rerun_reset.sql` and list it in `solution_artifacts_generated.md`.
+
+---
+
+### Step 4.6: User Approval Gate (MANDATORY)
 
 **⚠️ MANDATORY STOPPING POINT**: Phase 5 MUST NOT begin until user explicitly approves the generated implementation code.
 
 > **ANNOUNCE PROGRESS** — output banner: Phase 4 of 5 — Implementation | `[████████████████░░░░]` 80% | Status: Awaiting User Input
 > ⚠️ WAITING FOR YOUR INPUT — review all generated scripts before any deployment begins.
 
-1. Present a summary of all generated files (SQL scripts, dbt models, UDFs, SPs, test data) with:
-   - File count by category (SQL, dbt, test data, docs)
-   - Which files are SC-as-is, modified, fully rewritten, or new
-   - Key design decisions made (e.g., column width changes, nullable adjustments)
-   - Any deviations from the MIGRATION_PLAN.md and why
-2. Tell user the output directory path and list the file tree
-3. Ask user to review the generated scripts
-4. Wait for explicit approval ("approved", "looks good", "go ahead", etc.)
-5. If changes requested → update files, re-present summary, and repeat
-6. Do NOT deploy anything to Snowflake until approval is received
+**REQUIRED**: Use the `AskUserQuestion` tool to collect approval. Do NOT proceed to Phase 5 based on a plain text response — approval must come through the tool.
+
+First, present a summary of all generated files:
+- File count by category (SQL, dbt models, seeds, UDFs, SPs, test data)
+- Which files are SC-as-is, SC-modified, fully rewritten, or new/manual
+- Key design decisions made (e.g., column width changes, nullable adjustments, SP renames)
+- Any deviations from `MIGRATION_PLAN.md` and why
+- Output directory path and full file tree
+
+Then ask the following via `AskUserQuestion`:
+
+- **Header**: "Scripts Review"
+- **Question**: "All implementation files have been generated at `<OUTPUT_DIR>/implementation/`. Please review the SQL scripts, dbt models, UDFs, and SPs. Are you ready to approve and proceed to Phase 5 deployment and testing?"
+- **Option A**: "Approved — deploy to Snowflake and run E2E tests"
+- **Option B**: "Changes needed — I'll describe what to fix" (if selected, ask follow-up, update files, re-present summary, and re-ask)
+- **Option C**: "Pause — I need more time to review" (if selected, run `cortex ctx task pause` and stop)
+
+**ENFORCEMENT RULES** — These are absolute constraints, not guidelines:
+- **HARD STOP — FORBIDDEN until "Approved" is explicitly selected via `AskUserQuestion`**: Do NOT call `sql_execute`, do NOT run `snow dbt deploy`, do NOT execute any `bash` command that connects to Snowflake, and do NOT use any other tool that creates or modifies Snowflake objects. No exceptions — even if all files are generated and ready.
+- A plain-text "yes", "go ahead", or similar conversational message does NOT count as approval. Approval must come as an explicit "Approved" option selection through the `AskUserQuestion` tool.
+- Do NOT start Phase 5 if the user selects "Changes needed" — update the files and re-present.
+- Do NOT start Phase 5 if the user selects "Pause" — run `cortex ctx task pause` and stop.
+- Only proceed to Phase 5 when "Approved" is explicitly selected through the tool.
 
 **Log** Phase 4 (including approval status) to `migration_phase_tracking.md` with start datetime, end datetime, duration, and the following stats:
 
@@ -822,9 +1284,55 @@ LET audit_id INT := TELECOM_ETL.PUBLIC.SEQ_AUDIT_ID.NEXTVAL;
 
 > **ANNOUNCE PROGRESS** — output banner: Phase 5 of 5 — Validation & Testing | `[█████████████████░░░]` 85% | Status: In Progress
 
+### Step 5.0: Pre-Deployment Gate (MANDATORY)
+
+Run these four checks before executing any SQL against Snowflake. **Do NOT proceed to Step 5.1 if any check fails.**
+
+**1. dbt node terminal status** (only if Step 4.4 ran):
+
+```bash
+uv run --project $MEP_SKILL_DIR python $TRACK_STATUS_PY \
+  validate-phase <OUTPUT_DIR>/.ssis-dbt-tracking/session_status.json 4
+```
+
+All dbt nodes must have terminal status. Zero nodes in `pending` or `dbt-tested`. If this fails, return to Step 4.4 and resolve or mark blocking nodes as `needs-user`.
+
+**2. EWI marker count in orchestration SQL** — zero blocking markers allowed:
+
+```bash
+grep -rn "!!!RESOLVE EWI!!!" <OUTPUT_DIR>/implementation/sql/
+```
+
+Expected: 0 matches. If any remain, fix them using `references/snowflake_patterns.md` before deploying.
+
+**3. dbt compile check** (if dbt project exists):
+
+```bash
+dbt compile --project-dir <OUTPUT_DIR>/implementation/dbt_project/ \
+            --profiles-dir ~/.dbt
+```
+
+Must exit 0. If it fails, return to Step 4.4 (dbt TDD Fix Loop) to resolve remaining compilation errors.
+
+**4. profiles.yml auth field check**:
+
+```bash
+grep -n "user:\|password:\|authenticator: externalbrowser\|token:\|private_key\|env_var" \
+  <OUTPUT_DIR>/implementation/dbt_project/profiles.yml 2>/dev/null
+```
+
+Expected: 0 matches. If any of these are found, remove them. `authenticator: oauth` is **correct and required** — do not remove it. The only forbidden authenticator value is `externalbrowser` (and any non-oauth value). Valid `profiles.yml` contains: `type`, `account`, `authenticator: oauth`, `role`, `database`, `warehouse`, `schema`, `threads`.
+
+**If all 4 pass**: proceed to Step 5.1.
+**If any fail**: report the specific failure with file path and line number. Wait for resolution before deploying.
+
+---
+
 ### Step 5.1: Deploy to Snowflake
 
-Execute SQL scripts in numbered order using `snowflake_sql_execute`. Fix any deployment errors iteratively.
+Execute SQL scripts in numbered order using `sql_execute`, passing `connection=<CONNECTION_NAME>` (the SQL connection confirmed in Step 4.1, e.g., `COCO_JK`) on every call. Fix any deployment errors iteratively.
+
+> **CONNECTION REQUIRED**: Never omit the `connection` parameter. Every `sql_execute` call in Phase 5 must explicitly specify `connection=<CONNECTION_NAME>`.
 
 **Common deployment issues** (from `references/snowflake_patterns.md`):
 - SQL UDFs with subqueries can't be used inside SP temp table context → use inline JOINs
@@ -883,7 +1391,34 @@ If the migration includes Snowflake Tasks (SSIS scheduled execution equivalent),
 - [ ] Files moved from source to processed stage
 - [ ] Tasks suspended after testing
 
-### Step 5.4: Validation Checklist
+### Step 5.4: Re-run Reset (when repeating E2E tests)
+
+When re-running the full pipeline for a second or subsequent E2E test (e.g., after fixing a bug found in Step 5.3), execute these reset steps **in order** before re-triggering the task DAG. Skipping any step causes 0-row runs or stale state errors.
+
+```sql
+-- 1. Restore source files from processed stage
+COPY FILES INTO @<source_stage>/ FROM @<processed_stage>/;
+
+-- 2. Refresh stage directory metadata (MANDATORY after COPY FILES)
+ALTER STAGE <source_stage> REFRESH;
+
+-- 3. Truncate target tables
+TRUNCATE TABLE <target_db>.<schema>.FACT_TRANSACTIONS;  -- or equivalent
+TRUNCATE TABLE <target_db>.<schema>.DIM_AUDIT;
+
+-- 4. Reset batch counter so next run starts at batch 1
+UPDATE <target_db>.<schema>.CONTROL_VARIABLES
+SET VARIABLE_VALUE = TO_VARIANT(0)
+WHERE VARIABLE_NAME = 'User_batch_id'
+  AND VARIABLE_SCOPE = 'Data_Load';
+
+-- 5. Trigger the pipeline
+EXECUTE TASK <target_db>.<schema>.<root_task>;
+```
+
+> **COPY FILES flattens paths**: files originally stored in subdirectories (`batch_0/file.csv`) will land at the stage root (`file.csv`) after restore. If any SP uses `LIST @stage PATTERN = '.*/.*\\.csv'`, it will return 0 rows. Fix: use `PATTERN = '.*\\.csv'` (see Step 4.5 check 10).
+
+
 
 - [ ] Infrastructure created successfully
 - [ ] Sample data loaded to stage
@@ -894,6 +1429,33 @@ If the migration includes Snowflake Tasks (SSIS scheduled execution equivalent),
 - [ ] Error handling works
 - [ ] File movement operations complete
 - [ ] Audit trail captures required metrics
+
+### Step 5.4b: Parallel Validation Queries (spawn read-only verify agents)
+
+Before writing the final test report, run validation queries in parallel to reduce wall-clock time. Spawn **one read-only `general-purpose` background agent per validation domain**. Each agent executes SQL queries against the deployed objects and writes its results to a findings file.
+
+**Spawn one agent per domain** (adapt to what was deployed):
+
+| Agent | Domain | Queries to run | Output file |
+|---|---|---|---|
+| row-count-verifier | Row counts | COUNT(*) on all target tables vs expected | `validation_row_counts.md` |
+| audit-verifier | Audit trail | All dim_audit records have SuccessfulProcessingInd='Y', no nulls in key fields | `validation_audit.md` |
+| file-movement-verifier | Stage state | Source stage empty, processed stage has expected file count | `validation_stages.md` |
+| udf-verifier | UDF smoke tests | Call each UDF with representative inputs, compare to expected | `validation_udfs.md` |
+| task-history-verifier | Task DAG history | SHOW TASK HISTORY, verify all tasks SUCCEEDED, check SCHEDULED_TIME | `validation_tasks.md` |
+
+**Spawn pattern**:
+```
+Spawn all agents in a single message (parallel).
+Agent Wait Protocol: end your turn. Do not write the test report until all agents return.
+```
+
+After all agents return:
+1. Check each output file exists and contains results
+2. Flag any agent that returned 0 rows or an error — re-run that agent's queries manually
+3. Collate all findings into Step 5.5 test report
+
+**Constraint**: Agents are read-only (`SELECT`, `SHOW`, `LIST`). They must NOT run `EXECUTE TASK`, `TRUNCATE`, `INSERT`, or any mutating statement.
 
 ### Step 5.5: Write Test Report
 
@@ -929,7 +1491,7 @@ Write `<OUTPUT_DIR>/Solution_End_End_Testing.md` with:
 - ✋ Phase 1, Step 1.0: Paths gathered from user
 - ✋ Phase 2: User selects implementation approach
 - ✋ Phase 3, Step 3.4: User approves MIGRATION_PLAN.md
-- ✋ Phase 4, Step 4.3: User approves generated implementation scripts (NO deployment until approved)
+- ✋ Phase 4, Step 4.6: User approves generated implementation scripts (NO deployment until approved)
 - ✋ Phase 5, Step 5.3: Task testing (if tasks were created — resume, execute, validate, suspend)
 - ✋ Phase 5: Final results presented
 
@@ -965,5 +1527,7 @@ Complete SSIS-to-Snowflake migration including:
 | `snow sql -q` returns truncated or empty results for multi-statement query | `-q` truncates multi-statement output above ~4k chars | Use `snow sql -f <file.sql>` for any query with multiple statements or large output |
 | COMMENT on TASK syntax error | Remove COMMENT clause — some task configurations don't support it |
 | Task cron won't fire immediately | Use `EXECUTE TASK <root>` for on-demand triggering instead of waiting for schedule |
-| `snow dbt deploy` fails — `profiles.yml` has auth fields | Remove `password`, `authenticator`, `token`, `private_key_path`, and all `env_var()` calls from `profiles.yml` — Snowflake-native dbt authenticates via the active session |
+| `snow dbt deploy` fails — `profiles.yml` has auth fields | Remove `user`, `password`, `token`, `private_key_path`, and all `env_var()` calls. Keep or add `authenticator: oauth` — this is **required** for Snowflake-native dbt. Remove `authenticator: externalbrowser` (browser auth is not available inside Snowflake's execution environment) |
 | `snow dbt deploy` fails — `env_var()` in `dbt_project.yml` | Replace `env_var('KEY')` with literal values or `{{ var('key') }}` in models; supply values at runtime via `ARGS='build --vars {"key":"value"}'` in `EXECUTE DBT PROJECT` |
+| `LIST @stage PATTERN = '.*/.*\\.csv'` returns 0 rows after restoring files | `COPY FILES` does not preserve subdirectory paths — files restored from a processed stage land at the stage root (`file.csv`, not `batch_0/file.csv`). The pattern `.*/.*` requires a `/` separator so it matches nothing at the root level | Change all SP `LIST` patterns from `.*/.*\\.csv` to `.*\\.csv` — this matches files at any depth (root or subdir). Verify with: `SELECT * FROM DIRECTORY(@stage)` |
+| After `COPY FILES`, `EXECUTE DBT PROJECT` processes 0 files | Control variable `User_FilePath` is empty or still points to the last processed file from a prior run | Truncate `dim_audit`, reset `User_batch_id = 0` in `control_variables`, run `ALTER STAGE <source_stg> REFRESH` before triggering the task DAG |
