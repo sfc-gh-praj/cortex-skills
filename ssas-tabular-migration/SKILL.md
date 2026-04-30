@@ -28,6 +28,44 @@ uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/<script>.py [args]
 
 ---
 
+## Before You Start — Resume Check
+
+If this session is **continuing a migration started in a previous session**, read the current status before running Phase 1:
+
+1. **Check for an existing status file:**
+   ```bash
+   uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/update_migration_status.py \
+     --status-file <OUTPUT_DIR>/migration_status.md \
+     --read
+   ```
+   Output (JSON to stdout, banner to stderr):
+   ```json
+   {"last_completed": 3, "in_progress": null, "pending": [4,5,6,7],
+    "resume_from": 4, "summary": "Phases 1–3 complete — resume from Phase 4"}
+   ```
+
+2. **Show progress banner** using the returned JSON:
+   ```
+   ┌──────────────────────────────────────────────────────┐
+   │ ✅  Phase 1 — Assess               complete          │
+   │ ✅  Phase 2 — Workload Assessment  complete          │
+   │ ✅  Phase 3 — Migration Plan       complete          │
+   │ ◐   Phase 4 — Schema DDL           in progress       │
+   │ ⬚   Phase 5 — DAX Translation      pending           │
+   │ ⬚   Phase 6 — Security             pending           │
+   │ ⬚   Phase 7 — Validate             pending           │
+   └──────────────────────────────────────────────────────┘
+   Resuming from Phase 4 — Schema DDL
+   ```
+   Symbols: ✅ = Completed, ◐ = In Progress, ⬚ = Pending / Not Started
+
+3. **Skip completed phases** — jump directly to the first ◐ or ⬚ phase.
+   Do NOT re-run ✅ Completed phases unless the user explicitly says `"restart from scratch"`.
+
+4. **No status file found** — if `migration_status.md` does not exist in `<OUTPUT_DIR>`, proceed with Phase 1 normally and ask the user for all required inputs.
+
+---
+
 ## Phase 1 — Assess
 
 **Goal:** Parse the model file (`.bim` or `.xmla`) and produce a complete inventory with complexity score.
@@ -37,12 +75,19 @@ uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/<script>.py [args]
 1. Ask user for:
    ```
    1. Path to model file (.bim or .xmla)
-   2. Target Snowflake schema (e.g. MY_DB.MY_SCHEMA)
-   3. Snowflake connection name (default: COCO_JK)
-   4. (Optional) Source Snowflake DB where tables are already migrated (e.g. ADVENTUREWORKSDW2022)
-   5. (Optional) Source schema within that DB (default: DBO)
+   2. Output directory for migration artifacts (default: same folder as the model file)
+      All generated files (ssas_inventory.json, MIGRATION_PLAN.md, ssas_ddl.sql, etc.)
+      will be written here. The directory will be created if it does not exist.
+   3. Target Snowflake schema (e.g. MY_DB.MY_SCHEMA)
+   4. Snowflake connection name (default: COCO_JK)
+   5. (Optional) Source Snowflake DB where tables are already migrated (e.g. ADVENTUREWORKSDW2022)
+   6. (Optional) Source schema within that DB (default: DBO)
    ```
-   If the user provides a source DB (question 4), pass `--source-db` and `--source-schema` to
+   Resolve `<OUTPUT_DIR>` once here and use it for every `--output` flag in all subsequent phases.
+   If the user provides a relative path, expand it against the current working directory.
+   If the user leaves it blank, default to the directory containing the model file.
+
+   If the user provides a source DB (question 5), pass `--source-db` and `--source-schema` to
    `parse_bim.py`. This enriches the inventory with actual row counts and sizes from Snowflake,
    changes Phase 4 DDL from CREATE TABLE to CREATE VIEW over the existing tables, and enables
    data-driven clustering/SOS decisions in Phase 2.
@@ -51,11 +96,11 @@ uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/<script>.py [args]
    ```bash
    # Without source DB (data not yet in Snowflake):
    uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/parse_bim.py \
-     --bim-path <MODEL_PATH> --output ./ssas_inventory.json
+     --bim-path <MODEL_PATH> --output <OUTPUT_DIR>/ssas_inventory.json
 
    # With source DB (data already migrated to Snowflake):
    uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/parse_bim.py \
-     --bim-path <MODEL_PATH> --output ./ssas_inventory.json \
+     --bim-path <MODEL_PATH> --output <OUTPUT_DIR>/ssas_inventory.json \
      --source-db <SOURCE_DB> --source-schema <SOURCE_SCHEMA> --connection <CONNECTION>
    ```
    `<MODEL_PATH>` is the path to either the `.bim` or `.xmla` file — the script auto-detects the format.
@@ -100,15 +145,15 @@ uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/<script>.py [args]
 
 ## Phase 2 — Workload Assessment
 
-**Goal:** Score each table for Interactive Table vs Regular Table suitability.
+**Goal:** Score each table for Interactive Table vs Regular Table suitability, apply row-count-aware clustering thresholds, and recommend Snowflake performance features.
 
 **Actions:**
 
 1. Run `assess_deployment.py` (asks 4 workload questions interactively):
    ```bash
    uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/assess_deployment.py \
-     --inventory ./ssas_inventory.json \
-     --output ./deployment_assessment.json
+     --inventory <OUTPUT_DIR>/ssas_inventory.json \
+     --output <OUTPUT_DIR>/deployment_assessment.json
    ```
 
 2. Questions asked:
@@ -117,22 +162,50 @@ uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/<script>.py [args]
    - Required response time (< 1s / 1–3s / 3+ s)
    - Refresh cadence (real-time / hourly / daily / weekly)
 
-3. Display recommendation table:
+3. **Clustering threshold logic** — the script automatically determines whether CLUSTER BY
+   is cost-justified based on actual row counts from the inventory (`sf_row_count`):
+
+   | Table type | Minimum rows for clustering | Below threshold → |
+   |---|---|---|
+   | Dimension table (on "one" side of relationships) | 1,000,000 rows | Downgrade to `REGULAR_TABLE` |
+   | Fact / wide table (on "many" side or unrelated) | 10,000,000 rows | Downgrade to `REGULAR_TABLE` |
+   | Interactive Table (any) | Same as above | Downgrade to `REGULAR_TABLE` |
+
+   **Why:** Snowflake micro-partitions are 16 MB compressed. Tables under these thresholds
+   typically fit in 1–2 partitions — there are no blocks to skip, so CLUSTER BY adds
+   automatic reclustering cost with zero query performance benefit. Snowflake's result cache
+   handles repeated identical queries (free, 24h TTL) at any data size.
+
+   If `--source-db` was NOT used in Phase 1 (no `sf_row_count` in inventory), thresholds
+   are skipped and the pure score-based recommendation is used.
+
+4. **Snowflake performance feature recommendations** — the script outputs per-table feature
+   suggestions based on row count and query pattern:
+
+   | Feature | When recommended | Cost model |
+   |---|---|---|
+   | **RESULT CACHE** | Always — all tables | Free, 24h TTL. No action needed. |
+   | **SEARCH OPTIMIZATION** | Selective filter pattern + key/FK columns + > 100K rows | Fixed monthly per-table fee + build credits. Best for point lookups (customer ID, order ID drill-throughs). |
+   | **QUERY ACCELERATION SERVICE** | Full-table scan or mixed pattern | Per-credit. Offloads scan partials to serverless nodes; reduces queue latency for ad-hoc queries. |
+   | **MATERIALIZED VIEW** | Fact table > 1M rows + repeated GROUP BY aggregations | Auto-maintained by Snowflake. Pre-computes common rollups. |
+   | **AUTOMATIC CLUSTERING** | Fact table > 50M rows | Ongoing reclustering credits. Keeps CLUSTER BY alignment as new data is appended. |
+   | **INTERACTIVE TABLE** | Score ≥ 70% AND rows ≥ threshold | Always-on warehouse (24h min auto-suspend). Only justified at > 100 concurrent users. |
+
+5. Display recommendation table (now includes `Rows` column and clustering skip notes):
    ```
-   Table                 Score  Recommendation                CLUSTER BY
-   ─────────────────────────────────────────────────────────────────────
-   FactSales              85%   INTERACTIVE_TABLE             order_date, region  ⚠
-   DimDate                75%   INTERACTIVE_TABLE             date_key            ⚠
-   DimProduct             62%   REGULAR_TABLE_WITH_CLUSTERING product_key
-   CalcTable               —    CALCULATED_VIEW               —
+   Table                          Rows    Score  Recommendation       Cluster By
+   ─────────────────────────────────────────────────────────────────────────────
+   FactSales              100,000,000     85%   INTERACTIVE_TABLE    order_date, region  ⚠
+   DimDate                      3,652     93%   REGULAR_TABLE        — (skipped: too small)
+   DimProduct                     606     62%   REGULAR_TABLE        — (skipped: too small)
    ```
 
-4. If any tables are flagged ⚠: display the cost warning block. Remind the user that
+6. If any tables are flagged ⚠: display the cost warning block. Remind the user that
    Interactive Warehouse cannot auto-suspend before 24 hours.
 
-5. Load `references/snowflake-equivalents.md` for Interactive Table syntax and constraints.
+7. Load `references/snowflake-equivalents.md` for Interactive Table syntax and constraints.
 
-**⚠️ STOPPING POINT**: Show scores and cost warnings. Ask:
+**⚠️ STOPPING POINT**: Show scores, clustering skip notes, cost warnings, and feature recommendations. Ask:
 ```
 Proceed with these recommendations? Options:
 1. Yes — generate migration plan with these recommendations
@@ -141,9 +214,51 @@ Proceed with these recommendations? Options:
 
 ---
 
+## Phase 2b — Build DAX Dependency Graph
+
+**Goal:** Analyse the DAX dependency chain across all measures and calculated columns.
+Produces a topological sort order used by Phase 5 to translate compound measures with
+their dependency SQL already available as context — preventing metric-referencing-metric
+and cross-table reference errors in the generated semantic view.
+
+**When to run:** Always recommended. Required when the model has compound measures
+(measures that reference other measures). Safe to skip only for trivial models with
+no measures at all.
+
+**Actions:**
+
+1. Run `build_dax_dag.py`:
+   ```bash
+   uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/build_dax_dag.py \
+     --inventory <OUTPUT_DIR>/ssas_inventory.json \
+     --output    <OUTPUT_DIR>/dax_dag.json
+   ```
+
+2. Review the summary:
+   - **Physical / renamed columns** — base leaf nodes (sql_expr = Snowflake physical name)
+   - **Calculated columns** — will become `facts[]` in the semantic view (row-level)
+   - **Measures** — will become `metrics[]` in the semantic view (aggregated)
+   - **Compound measures (≥2 deps)** — listed separately; these require dependency-aware LLM translation
+   - **⚠ Cycle warnings** — investigate these before Phase 5 (cyclic DAX usually indicates incorrect model design)
+
+3. Dependency chain overview:
+   ```
+   Physical / renamed columns  ← leaf nodes (no translation needed)
+             ↓
+   Calculated columns          ← translated with column deps as context  (→ facts[])
+             ↓
+   Base measures               ← translated with column/calc-col deps    (→ metrics[])
+             ↓
+   Compound measures           ← translated with all deps inlined         (→ metrics[])
+   ```
+
+4. Note the output path — it will be used as `--dag` in Phase 5.
+
+---
+
 ## Phase 3 — Migration Plan
 
-**Goal:** Write `MIGRATION_PLAN.md` and `migration_status.md` to the working directory.
+**Goal:** Write `MIGRATION_PLAN.md` and `migration_status.md` to the output artifacts directory.
 User must approve the plan before any DDL is executed.
 
 **Actions:**
@@ -151,14 +266,14 @@ User must approve the plan before any DDL is executed.
 1. Run `generate_migration_plan.py`:
    ```bash
    uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/generate_migration_plan.py \
-     --inventory ./ssas_inventory.json \
-     --assessment ./deployment_assessment.json \
+     --inventory <OUTPUT_DIR>/ssas_inventory.json \
+     --assessment <OUTPUT_DIR>/deployment_assessment.json \
      --target-schema <DB.SCHEMA> \
-     --output ./MIGRATION_PLAN.md \
-     --status ./migration_status.md
+     --output <OUTPUT_DIR>/MIGRATION_PLAN.md \
+     --status <OUTPUT_DIR>/migration_status.md
    ```
 
-2. Two files are written to the current working directory:
+2. Two files are written to `<OUTPUT_DIR>`:
    - `MIGRATION_PLAN.md` — full plan including table type assignments, CLUSTER BY rationale
      mapped to source DAX patterns, cost warnings, DAX translation scope, security scope,
      ballpark token estimates, risks, and an approval section
@@ -167,8 +282,8 @@ User must approve the plan before any DDL is executed.
 
 3. Show the user:
    ```
-   Migration plan written to: ./MIGRATION_PLAN.md
-   Status tracker written to: ./migration_status.md
+   Migration plan written to: <OUTPUT_DIR>/MIGRATION_PLAN.md
+   Status tracker written to: <OUTPUT_DIR>/migration_status.md
    ```
 
 **⚠️ HARD STOPPING POINT — APPROVAL REQUIRED**
@@ -176,7 +291,7 @@ User must approve the plan before any DDL is executed.
 Do NOT proceed to Phase 4 until the user explicitly approves.
 
 ```
-MIGRATION_PLAN.md has been written to your working directory.
+MIGRATION_PLAN.md has been written to <OUTPUT_DIR>.
 
 Review it carefully — it includes:
   • Table-by-table type assignments (Interactive / Regular / View)
@@ -207,13 +322,31 @@ If user replies 'approved': continue to Phase 4.
      --phase "Phase 4" --status in_progress
    ```
 
+> **Reserved-word pre-check** — scan for columns aliased to Snowflake SQL keywords before generating DDL.
+> These cause `invalid identifier` errors at deployment time. Takes ~5 seconds:
+> ```python
+> import json
+> inv = json.load(open('<OUTPUT_DIR>/ssas_inventory.json'))
+> reserved = {'DATE','TIME','YEAR','MONTH','DAY','HOUR','ORDER','STATUS','VALUE',
+>             'NAME','TYPE','LEVEL','RANK','ROLE','USER','GROUP','TABLE','INDEX'}
+> for t in inv['tables']:
+>     sf_map = t.get('sf_column_map') or {}
+>     for c in t.get('columns', []):
+>         alias = sf_map.get(c['name']) or c['name']
+>         if alias.upper() in reserved:
+>             print(f"⚠ Reserved: {t['name']}.{c['name']}  →  alias '{alias}'")
+> ```
+> If any ⚠ warnings appear: update `sf_column_map` in `ssas_inventory.json`
+> (e.g. `"Date" → "FULLDATE"`) before running the step below.
+> `generate_semantic_view.py` also checks this automatically and emits the same warnings.
+
 2. Run `generate_ddl.py` with assessment:
    ```bash
    uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/generate_ddl.py \
-     --inventory ./ssas_inventory.json \
-     --assessment ./deployment_assessment.json \
+     --inventory <OUTPUT_DIR>/ssas_inventory.json \
+     --assessment <OUTPUT_DIR>/deployment_assessment.json \
      --target-schema <DB.SCHEMA> \
-     --output ./ssas_ddl.sql
+     --output <OUTPUT_DIR>/ssas_ddl.sql
    ```
 
 3. Show counts: regular tables, interactive tables, calculated views, skipped hidden.
@@ -226,7 +359,7 @@ If user replies 'approved': continue to Phase 4.
 **⚠️ DDL VALIDATION STOPPING POINT — USER MUST REVIEW BEFORE DEPLOY**
 
 ```
-ssas_ddl.sql has been written to your working directory.
+ssas_ddl.sql has been written to <OUTPUT_DIR>.
 
 IMPORTANT: Review the DDL file before any objects are created in Snowflake.
 Check:
@@ -236,7 +369,7 @@ Check:
   • OLS REVOKE statements in the footer are correct
 
 Reply one of:
-  'deploy ddl'    → execute:  snow sql -f ./ssas_ddl.sql --connection <CONN>
+  'deploy ddl'    → execute:  snow sql -f <OUTPUT_DIR>/ssas_ddl.sql --connection <CONN>
   'review first'  → open the file; come back when ready to deploy
   'skip deploy'   → save file only, deploy manually later
 ```
@@ -271,10 +404,25 @@ Do NOT execute `snow sql` without this explicit confirmation.
 2. **Load** `references/dax-to-sql-patterns.md` for context.
 
 3. Run `convert_dax.py`:
+
+   **With DAG** (recommended when compound measures exist — `dax_dag.json` from Phase 2b):
    ```bash
    uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/convert_dax.py \
-     --inventory ./ssas_inventory.json \
-     --output ./ssas_measures_translated.json \
+     --inventory <OUTPUT_DIR>/ssas_inventory.json \
+     --dag       <OUTPUT_DIR>/dax_dag.json \
+     --output    <OUTPUT_DIR>/ssas_measures_translated.json \
+     --connection <CONNECTION>
+   ```
+   Using `--dag` translates in dependency order and passes each dependency's already-translated
+   SQL as LLM context, ensuring compound measures produce fully self-contained SQL expressions
+   with no cross-table refs or metric-name references.  Writes `sql_expr`/`inline_sql` back to
+   `dax_dag.json` for use in Phase 5a.
+
+   **Without DAG** (simple models with no compound measures):
+   ```bash
+   uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/convert_dax.py \
+     --inventory <OUTPUT_DIR>/ssas_inventory.json \
+     --output    <OUTPUT_DIR>/ssas_measures_translated.json \
      --connection <CONNECTION>
    ```
 
@@ -291,21 +439,48 @@ Do NOT execute `snow sql` without this explicit confirmation.
 5. For each `manual_review` item: present the DAX and ask user for the SQL equivalent. Update `ssas_measures_translated.json`.
 
 6. Run `generate_semantic_view.py`:
+
+   **With DAG** (recommended — uses `inline_sql` from `dax_dag.json` for self-contained metrics):
+   ```bash
+   uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/generate_semantic_view.py \
+     --inventory <OUTPUT_DIR>/ssas_inventory.json \
+     --measures  <OUTPUT_DIR>/ssas_measures_translated.json \
+     --dag       <OUTPUT_DIR>/dax_dag.json \
+     --target-schema <DB.SCHEMA> \
+     --output    <OUTPUT_DIR>/ssas_semantic_view.yaml
+   ```
+
+   **Without DAG:**
    ```bash
    # Generate YAML only:
    uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/generate_semantic_view.py \
-     --inventory ./ssas_inventory.json \
-     --measures ./ssas_measures_translated.json \
+     --inventory <OUTPUT_DIR>/ssas_inventory.json \
+     --measures <OUTPUT_DIR>/ssas_measures_translated.json \
      --target-schema <DB.SCHEMA> \
-     --output ./ssas_semantic_view.yaml
+     --output <OUTPUT_DIR>/ssas_semantic_view.yaml
 
    # Generate YAML and deploy to Snowflake in one step:
    uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/generate_semantic_view.py \
-     --inventory ./ssas_inventory.json \
-     --measures ./ssas_measures_translated.json \
+     --inventory <OUTPUT_DIR>/ssas_inventory.json \
+     --measures <OUTPUT_DIR>/ssas_measures_translated.json \
      --target-schema <DB.SCHEMA> \
-     --output ./ssas_semantic_view.yaml \
+     --output <OUTPUT_DIR>/ssas_semantic_view.yaml \
      --deploy --connection <CONNECTION>
+   ```
+
+   **Generation warnings** — fix all ⚠ before deploying:
+   ```
+   ⚠ RESERVED WORD    — column alias is a Snowflake keyword
+     Fix: update sf_column_map in inventory + rename alias in DDL view
+
+   ⚠ FACT AGGREGATE STRIPPED — aggregate wrapper removed automatically
+     (SUM/COUNT/AVG on a row-level calculated column; safe to ignore)
+
+   ⚠ CROSS-TABLE REF  — metric references OtherTable.Column
+     Fix: replace with equivalent local column (e.g. ORDERDATE)
+
+   ⚠ METRIC REF       — metric references another metric by name
+     Fix: re-run convert_dax.py with --dag for auto-inlining, or inline manually
    ```
    The script uses `sf_column_map` from the enriched inventory to resolve Snowflake
    physical column names in `expr` fields, and skips RELATED() cross-table calculated
@@ -314,11 +489,11 @@ Do NOT execute `snow sql` without this explicit confirmation.
 7. Re-run `generate_ddl.py` with `--measures-json` to embed translated calculated columns:
    ```bash
    uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/generate_ddl.py \
-     --inventory ./ssas_inventory.json \
-     --assessment ./deployment_assessment.json \
-     --measures-json ./ssas_measures_translated.json \
+     --inventory <OUTPUT_DIR>/ssas_inventory.json \
+     --assessment <OUTPUT_DIR>/deployment_assessment.json \
+     --measures-json <OUTPUT_DIR>/ssas_measures_translated.json \
      --target-schema <DB.SCHEMA> \
-     --output ./ssas_ddl_with_views.sql
+     --output <OUTPUT_DIR>/ssas_ddl_with_views.sql
    ```
 
 8. Update status (use actual token count from convert_dax.py output if available):
@@ -331,7 +506,7 @@ Do NOT execute `snow sql` without this explicit confirmation.
 
 **⚠️ STOPPING POINT**: Show translation summary and YAML preview. Ask:
 ```
-1. Validate YAML: cortex reflect ./ssas_semantic_view.yaml
+1. Validate YAML: cortex reflect <OUTPUT_DIR>/ssas_semantic_view.yaml
 2. Deploy semantic view to Snowflake now
 3. Generate Power BI zero-break views
 4. Save files only
@@ -348,7 +523,7 @@ Do NOT execute `snow sql` without this explicit confirmation.
 1. If not already deployed via `--deploy` flag in Phase 5, run `deploy_semantic_view.py`:
    ```bash
    uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/deploy_semantic_view.py \
-     --yaml-file ./ssas_semantic_view.yaml \
+     --yaml-file <OUTPUT_DIR>/ssas_semantic_view.yaml \
      --target-schema <DB.SCHEMA> \
      --connection <CONNECTION>
    ```
@@ -379,19 +554,19 @@ enabling existing Power BI reports to reconnect without modification.
    ```bash
    # Generate SQL file only:
    uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/generate_powerbi_views.py \
-     --inventory ./ssas_inventory.json \
-     --measures ./ssas_measures_translated.json \
+     --inventory <OUTPUT_DIR>/ssas_inventory.json \
+     --measures <OUTPUT_DIR>/ssas_measures_translated.json \
      --source-schema <DB.SOURCE_SCHEMA> \
      --target-schema <DB.PBI_SCHEMA> \
-     --output ./powerbi_views.sql
+     --output <OUTPUT_DIR>/powerbi_views.sql
 
    # Generate and deploy:
    uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/generate_powerbi_views.py \
-     --inventory ./ssas_inventory.json \
-     --measures ./ssas_measures_translated.json \
+     --inventory <OUTPUT_DIR>/ssas_inventory.json \
+     --measures <OUTPUT_DIR>/ssas_measures_translated.json \
      --source-schema <DB.SOURCE_SCHEMA> \
      --target-schema <DB.PBI_SCHEMA> \
-     --output ./powerbi_views.sql \
+     --output <OUTPUT_DIR>/powerbi_views.sql \
      --deploy --connection <CONNECTION>
    ```
 
@@ -489,11 +664,11 @@ The DDL file (`ssas_ddl.sql`) already contains the generated REVOKE / masking po
 2. Generate the migration mapping report:
    ```bash
    uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/generate_migration_mapping.py \
-     --inventory ./ssas_inventory.json \
-     --measures ./ssas_measures_translated.json \
+     --inventory <OUTPUT_DIR>/ssas_inventory.json \
+     --measures <OUTPUT_DIR>/ssas_measures_translated.json \
      --target-schema <DB.SCHEMA> \
      --pbi-schema <DB.PBI_SCHEMA> \
-     --output ./MIGRATION_MAPPING.md
+     --output <OUTPUT_DIR>/MIGRATION_MAPPING.md
    ```
    This produces a detailed report covering: table mapping, column mapping per table,
    calculated columns, measures, relationships, hierarchies, manual review items,
@@ -530,6 +705,10 @@ Phase 2: WORKLOAD ASSESSMENT
   (4 questions + BIM signal scoring → per-table recommendation)
   ⚠️ STOP: confirm recommendations + cost warnings
   ↓
+Phase 2b: DAX DEPENDENCY GRAPH
+  build_dax_dag.py → dax_dag.json
+  (topological sort order for dependency-aware DAX translation)
+  ↓
 Phase 3: MIGRATION PLAN
   generate_migration_plan.py → MIGRATION_PLAN.md + migration_status.md
   ⚠️ HARD STOP: user must reply 'approved' before Phase 4
@@ -540,8 +719,8 @@ Phase 4: SCHEMA DDL
   update_migration_status.py → Phase 4 completed
   ↓
 Phase 5: DAX TRANSLATION + SEMANTIC VIEW
-  convert_dax.py → ssas_measures_translated.json
-  generate_semantic_view.py [--deploy] → ssas_semantic_view.yaml [+ Snowflake object]
+  convert_dax.py [--dag dax_dag.json] → ssas_measures_translated.json (+ updated dax_dag.json)
+  generate_semantic_view.py [--dag dax_dag.json] → ssas_semantic_view.yaml [+ Snowflake object]
   generate_ddl.py --measures-json → ssas_ddl_with_views.sql
   update_migration_status.py → Phase 5 completed
   ⚠️ STOP: review translations + choose deploy / PBI views / save
@@ -569,9 +748,12 @@ Phase 7: VALIDATE & EXPORT
 
 ## Output Files
 
+All files are written to `<OUTPUT_DIR>` (specified in Phase 1 question 2).
+
 | File | Generated by | Contents |
 |---|---|---|
 | `ssas_inventory.json` | `parse_bim.py` | Full parsed model inventory (+ `sf_column_map`, `calculated_column_resolution` when `--source-db` used) |
+| `dax_dag.json` | `build_dax_dag.py` | DAX dependency graph — nodes (physical/calc/measure), edges, topological order; updated by `convert_dax.py --dag` with `sql_expr`/`inline_sql` |
 | `deployment_assessment.json` | `assess_deployment.py` | Per-table Interactive/Regular recommendation + scores |
 | `MIGRATION_PLAN.md` | `generate_migration_plan.py` | Full migration plan — table types, CLUSTER BY rationale, token estimates, risks |
 | `migration_status.md` | `generate_migration_plan.py` | Living phase-by-phase status tracker (updated each phase) |
@@ -609,3 +791,22 @@ Phase 7: VALIDATE & EXPORT
 **Power BI views show wrong column names** → `generate_powerbi_views.py` uses `sf_column_map` from the enriched inventory. Re-run `parse_bim.py` with `--source-db` to refresh the mapping if tables were altered after initial parsing.
 
 **RELATED() calculated columns missing from semantic view** → by design. Cross-table RELATED() columns are excluded from the semantic view YAML and instead materialized as LEFT JOINs in Power BI migration views. Check `powerbi_views.sql` for these columns.
+
+**`invalid identifier 'DATE'`** (or `TIME`, `YEAR`, `MONTH`, `ORDER`, `STATUS`, `VALUE`, etc.) → column alias is a Snowflake reserved word. Run the reserved-word pre-check in Phase 4, update `sf_column_map` in the inventory with a safe alias (e.g. `"Date" → "FULLDATE"`), and regenerate DDL + semantic view YAML. `generate_semantic_view.py` emits `⚠ RESERVED WORD` warnings automatically.
+
+**`sql_translation` in `ssas_measures_translated.json` contains backtick fences (`` ```sql … ``` ``)** → the LLM wrapped SQL in markdown code fences. Automatic since skill update — `_clean_llm_sql()` in `convert_dax.py` strips these at translation time. For existing output: re-run `convert_dax.py`.
+
+**`Object 'TABLENAME' does not exist` when calling `SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML`** → session context was not set; the procedure resolves table names against the current schema. Fixed in `deploy_semantic_view.py` — `USE DATABASE` and `USE SCHEMA` are set automatically before the CALL.
+
+**`invalid identifier 'OTHERTABLE.COLUMNNAME'` in a metric** → metric expression references a column from another table (cross-table ref). `generate_semantic_view.py` emits `⚠ CROSS-TABLE REF`. Replace the ref with an equivalent column from the local fact table (e.g. `DimDate.FULLDATE` → `ORDERDATE`).
+
+**`invalid identifier 'METRICNAME'` in a metric** → metric expression references another metric by name. `generate_semantic_view.py` emits `⚠ METRIC REF`. Fix: run `build_dax_dag.py` + `convert_dax.py --dag` to translate with automatic dependency inlining, then regenerate the YAML.
+
+**`Invalid fact definition: … without an aggregate`** → a calculated-column fact expression uses `SUM()` / `COUNT()` (LLM translated it as a measure). `generate_semantic_view.py` now auto-strips aggregate wrappers and emits `⚠ FACT AGGREGATE STRIPPED`. Re-run `generate_semantic_view.py` on the existing YAML to apply the fix.
+
+**Compound measure translations reference other measure names instead of SQL** → `convert_dax.py` ran without `--dag` so dependency order was not guaranteed. Run `build_dax_dag.py` first, then re-run `convert_dax.py --dag <OUTPUT_DIR>/dax_dag.json`. Topological translation order with dependency SQL context ensures compound measures are fully inlined.
+
+**Migration restarts from Phase 1 on session resume** → `migration_status.md` was not read before starting. Run `update_migration_status.py --read` at the start of a new session; the skill now checks for an existing status file and shows a resume banner. Skip all ✅ Completed phases.
+
+**`update_migration_status.py` reports "phase not found"** → phase name must match exactly the start of the cell, e.g. `--phase "Phase 4"` (not `"Phase 4 — Schema DDL"`).
+

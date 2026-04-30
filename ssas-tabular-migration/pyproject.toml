@@ -1,0 +1,8 @@
+[project]
+name = "ssas-tabular-migration"
+version = "0.1.0"
+description = "Migrate SSAS Tabular models (model.bim) to Snowflake"
+requires-python = ">=3.11"
+dependencies = [
+    "snowflake-connector-python>=3.0.0",
+]
