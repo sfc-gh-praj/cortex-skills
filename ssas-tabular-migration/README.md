@@ -4,6 +4,62 @@ A Cortex Code skill that automates the end-to-end migration of SQL Server Analys
 
 ---
 
+## Getting Started
+
+### Step 1 — Extract your model file from SSAS
+
+You need either a `.bim` or `.xmla` file from your SSAS Tabular database. **`.xmla` is recommended** — it is more portable and works with all compatibility levels ≥ 1200.
+
+#### Export `.xmla` from SSMS (recommended)
+
+1. Open **SQL Server Management Studio (SSMS)**
+2. Connect to your **Analysis Services** instance
+3. In Object Explorer, right-click your database → **Script Database As → CREATE To → File**
+4. Save the file as `YourModel.xmla`
+
+> The exported file will contain a SOAP/XMLA envelope with a `<Statement>` element wrapping the JSON model definition. `parse_bim.py` detects this format automatically.
+
+#### Export `.bim` from Visual Studio / SSDT
+
+1. Open your Tabular project in **Visual Studio** with the Analysis Services extension
+2. Navigate to the project folder
+3. Copy `Model.bim` from the project root — this is plain JSON and can be passed directly
+
+> **Compatibility level requirement:** Both formats require **compatibility level 1200 or higher**. If your model is at 1100/1103 (XML-based), `parse_bim.py` will exit with upgrade instructions.
+
+---
+
+### Step 2 — Start the migration in Cortex Code
+
+Paste the following prompt into Cortex Code to begin the full guided migration:
+
+```
+Migrate my SSAS Tabular model to Snowflake.
+
+Model file: /path/to/YourModel.xmla        ← or .bim
+Output folder: /path/to/output/            ← where artifacts will be saved
+Target Snowflake schema: MY_DB.MY_SCHEMA   ← DB.SCHEMA to create objects in
+Snowflake connection: MY_CONNECTION        ← your configured connection name
+
+The source data is already in Snowflake at MY_SOURCE_DB.DBO   ← omit if not yet migrated
+```
+
+**Minimal version (fewest inputs):**
+
+```
+Migrate the SSAS Tabular model at /path/to/YourModel.xmla to Snowflake schema MY_DB.MY_SCHEMA using connection MY_CONNECTION.
+```
+
+Cortex Code will ask for any missing details before proceeding.
+
+#### What Cortex Code does with this prompt
+
+1. Loads the `ssas-tabular-migration` skill automatically
+2. Checks for an existing `migration_status.md` — resumes from the last completed phase if one is found
+3. Walks you through all seven phases with explicit stopping points before any DDL is deployed
+
+---
+
 ## What This Skill Does
 
 Walks you through seven phases to produce a complete, deployment-ready set of Snowflake SQL artifacts from a `model.bim` file:
