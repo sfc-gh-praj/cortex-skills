@@ -130,7 +130,8 @@ def format_string_to_synonyms(format_string: str | None) -> list[str]:
 def build_table_entry(table: dict, schema: str, measures_by_table: dict,
                       calc_cols_index: dict = None,
                       known_table_names: set | None = None,
-                      all_metric_names: set | None = None) -> dict:
+                      all_metric_names: set | None = None,
+                      rel_pk: str | None = None) -> dict:
     tname = table["name"]
     safe = safe_name(tname)
 
@@ -253,14 +254,16 @@ def build_table_entry(table: dict, schema: str, measures_by_table: dict,
         metric = {
             "name": metric_name,
             "expr": expr,
-            "data_type": "FLOAT",
         }
         if synonyms:
             metric["synonyms"] = synonyms
-        if item.get("kpi"):
-            kpi = item["kpi"]
-            if kpi.get("target_expression"):
-                metric["_kpi_target_dax"] = kpi["target_expression"]  # informational
+        # description from DAG node (overrides format_string synonyms with richer context)
+        if item.get("description"):
+            metric["description"] = item["description"]
+        # additional synonyms from DAG (merge with format_string-derived ones)
+        if item.get("synonyms"):
+            dag_syns = [s for s in item["synonyms"] if s not in metric.get("synonyms", [])]
+            metric["synonyms"] = metric.get("synonyms", []) + dag_syns
         metrics.append(metric)
 
     # Calculated columns → additional dimensions/facts with SQL expressions
@@ -295,11 +298,25 @@ def build_table_entry(table: dict, schema: str, measures_by_table: dict,
         "base_table": base_table,
     }
 
-    # Primary key: first column marked is_key, or first column
+    # Primary key selection — must match the right_column used in relationships pointing
+    # to this table so SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML accepts the relationships: format.
+    # Priority: (1) rel_pk (to_column from relationship), (2) is_key columns,
+    #           (3) columns ending in "Key" (DW convention), (4) first visible column.
+    col_names_safe = {safe_name(c["name"]) for c in table["columns"]}
     key_cols = [c for c in table["columns"] if c.get("is_key")]
-    if key_cols:
-        # primary_key must be an object with a "columns" array
+    if rel_pk and rel_pk in col_names_safe:
+        result["primary_key"] = {"columns": [rel_pk]}
+    elif key_cols and safe_name(key_cols[0]["name"]) in col_names_safe:
         result["primary_key"] = {"columns": [safe_name(key_cols[0]["name"])]}
+    else:
+        if not key_cols:
+            key_cols = [c for c in table["columns"] if c["name"].lower().endswith("key") and not c.get("is_hidden")]
+        if not key_cols:
+            visible = [c for c in table["columns"] if not c.get("is_hidden")]
+            if visible:
+                key_cols = [visible[0]]
+        if key_cols:
+            result["primary_key"] = {"columns": [safe_name(key_cols[0]["name"])]}
 
     if dimensions:
         result["dimensions"] = dimensions
@@ -328,6 +345,28 @@ def build_joins(relationships: list[dict]) -> list[dict]:
             },
         })
     return joins
+
+
+def build_relationships(relationships: list[dict]) -> list[dict]:
+    """Build Cortex Analyst --model compatible relationships (uses relationship_columns format)."""
+    rels = []
+    for r in relationships:
+        if not r.get("is_active", True):
+            continue  # skip inactive relationships
+        rels.append({
+            "name": f"{safe_name(r['from_table'])}_to_{safe_name(r['to_table'])}",
+            "left_table": safe_name(r["from_table"]),
+            "right_table": safe_name(r["to_table"]),
+            "relationship_type": "many_to_one",
+            "join_type": "left_outer",
+            "relationship_columns": [
+                {
+                    "left_column": r["from_column"],
+                    "right_column": r["to_column"],
+                }
+            ],
+        })
+    return rels
 
 
 def dict_to_yaml(d, indent=0) -> str:
@@ -430,10 +469,23 @@ def main():
             for n in _dag["nodes"].values()
             if n.get("inline_sql") and n["type"] in ("measure", "calculated_column")
         }
+        # Also carry description and synonyms from DAG nodes to measure items
+        _dag_meta = {
+            (n["table"], n["name"]): {
+                "description": n.get("description"),
+                "synonyms": n.get("synonyms"),
+            }
+            for n in _dag["nodes"].values()
+            if n["type"] in ("measure", "calculated_column")
+        }
         for _item in measures_list:
             _key = (_item.get("table", ""), _item.get("name", ""))
             if _key in _dag_inline:
                 _item["sql_translation"] = _dag_inline[_key]
+            if _key in _dag_meta:
+                for _field in ("description", "synonyms"):
+                    if _dag_meta[_key][_field] and not _item.get(_field):
+                        _item[_field] = _dag_meta[_key][_field]
         print(f"  DAG inline_sql applied: {len(_dag_inline)} nodes overridden")
 
     # Build sets used by safeguard checks in build_table_entry()
@@ -451,6 +503,13 @@ def main():
     schema = args.target_schema.strip().rstrip("/")
     view_name = safe_name(args.view_name or inventory["model_name"])
 
+    # Build right_key_map FIRST — primary_key must align with relationship right_column
+    # so SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML accepts the relationships: format.
+    right_key_map: dict[str, str] = {}
+    for r in inventory["relationships"]:
+        if r.get("is_active", True):
+            right_key_map[r["to_table"].lower()] = safe_name(r["to_column"])
+
     tables_yaml = []
     for table in inventory["tables"]:
         if table.get("is_hidden"):
@@ -459,10 +518,12 @@ def main():
             table, schema, measures_by_table, calc_cols_index,
             known_table_names=known_table_names,
             all_metric_names=all_metric_names,
+            rel_pk=right_key_map.get(table["name"].lower()),
         )
         tables_yaml.append(entry)
 
     joins = build_joins(inventory["relationships"])
+    relationships = build_relationships(inventory["relationships"])
 
     # Semantic view top-level structure
     sem_view = {
@@ -498,12 +559,15 @@ def main():
                 yaml_lines.append(line)
         yaml_lines.append("")
 
-    if joins:
-        yaml_lines.append("joins:")
-        for j in joins:
-            jlines = dict_to_yaml(j, indent=2).split("\n")
+    # Use relationships: format — accepted by SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML
+    # AND by cortex analyst query --view. The old joins: format only worked for
+    # deployment but broke --view (SemanticModel proto has no "joins" field).
+    if relationships:
+        yaml_lines.append("relationships:")
+        for r in relationships:
+            rlines = dict_to_yaml(r, indent=2).split("\n")
             first = True
-            for line in jlines:
+            for line in rlines:
                 if not line.strip():
                     continue
                 if first:
@@ -521,16 +585,63 @@ def main():
     with open(out_path, "w", encoding="utf-8") as f:
         f.write(yaml_text)
 
+    # Also generate Cortex Analyst --model compatible YAML (relationships: format)
+    analyst_yaml_lines = [
+        f"# Cortex Analyst --model YAML — generated from SSAS Tabular model: {inventory['model_name']}",
+        f"# Use: cortex analyst query \"<question>\" --model <this_file> --connection <conn>",
+        f"# NOTE: This file uses 'relationships:' format required by Cortex Analyst --model.",
+        f"#       It differs from the semantic view YAML (which uses 'joins:').",
+        "",
+        f"name: {view_name}",
+        "",
+        "tables:",
+    ]
+    for t in tables_yaml:
+        tlines = dict_to_yaml(t, indent=2).split("\n")
+        first = True
+        for line in tlines:
+            if not line.strip():
+                continue
+            if first:
+                stripped = line.lstrip()
+                analyst_yaml_lines.append(f"  - {stripped}")
+                first = False
+            else:
+                analyst_yaml_lines.append(line)
+        analyst_yaml_lines.append("")
+
+    if relationships:
+        analyst_yaml_lines.append("relationships:")
+        for r in relationships:
+            rlines = dict_to_yaml(r, indent=2).split("\n")
+            first = True
+            for line in rlines:
+                if not line.strip():
+                    continue
+                if first:
+                    stripped = line.lstrip()
+                    analyst_yaml_lines.append(f"  - {stripped}")
+                    first = False
+                else:
+                    analyst_yaml_lines.append(line)
+        analyst_yaml_lines.append("")
+
+    analyst_yaml_text = "\n".join(analyst_yaml_lines)
+    out_path_analyst = out_path.parent / (out_path.stem + "_analyst" + out_path.suffix)
+    with open(out_path_analyst, "w", encoding="utf-8") as f:
+        f.write(analyst_yaml_text)
+
     metric_count = sum(len(t.get("metrics", [])) for t in tables_yaml)
     dim_count = sum(len(t.get("dimensions", [])) for t in tables_yaml)
     fact_count = sum(len(t.get("facts", [])) for t in tables_yaml)
     print(f"Generated semantic view: {view_name}")
-    print(f"  Tables:     {len(tables_yaml)}")
-    print(f"  Dimensions: {dim_count}")
-    print(f"  Facts:      {fact_count}")
-    print(f"  Metrics:    {metric_count}")
-    print(f"  Joins:      {len(joins)}")
-    print(f"  Output:     {args.output}")
+    print(f"  Tables:        {len(tables_yaml)}")
+    print(f"  Dimensions:    {dim_count}")
+    print(f"  Facts:         {fact_count}")
+    print(f"  Metrics:       {metric_count}")
+    print(f"  Relationships: {len(relationships)}")
+    print(f"  Output:              {args.output}")
+    print(f"  Analyst YAML output: {out_path_analyst}")
 
     # Deploy to Snowflake if requested
     if args.deploy:
@@ -549,8 +660,8 @@ def main():
 
         try:
             fq_name = deploy_semantic_view(yaml_clean, schema, args.connection)
-            print(f"\nQuery it with:")
-            print(f"  cortex analyst query \"your question\" --view {fq_name}")
+            print(f"\nTest with Cortex Analyst:")
+            print(f"  cortex analyst query \"your question\" --model {out_path_analyst} --connection {args.connection}")
         except Exception as e:
             print(f"\nWARNING: Deployment failed — {e}", file=sys.stderr)
             print("You can deploy manually with:")
@@ -561,6 +672,7 @@ def main():
         print("Next steps:")
         print(f"  Validate:  cortex reflect {args.output} --target-schema {schema}")
         print(f"  Deploy:    re-run with --deploy --connection {args.connection}")
+        print(f"  Test:      cortex analyst query \"your question\" --model {out_path_analyst} --connection {args.connection}")
 
 
 if __name__ == "__main__":
