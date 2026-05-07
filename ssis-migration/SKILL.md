@@ -14,6 +14,7 @@ End-to-end migration of SSIS packages to Snowflake using SnowConvert output. Fol
 - `.dtsx` package files available locally
 - Python 3.9+ available locally (used by the bundled assessment script)
 - Snowflake account with appropriate permissions
+- `snowflake-migration` plugin installed — required for the automated dbt TDD Fix Loop (Phase 4). Install by adding `"https://github.com/Snowflake-Labs/cortex-code-migrations/tree/preview/plugin"` to the `plugins` array in `~/.snowflake/cortex/settings.json`, then restart Cortex Code.
 - SnowConvert output is **optional** — the skill supports both "start from scratch" (manual `.dtsx` analysis) and "use SnowConvert output" paths
 
 ## Setup
@@ -40,7 +41,7 @@ MEP_SKILL_DIR=$(find ~/.snowflake/cortex/remote-cache \
 | `SSIS_PLATFORM_DIR` | `$MEP_SKILL_DIR/platforms/ssis` | Phase 4 Step 4.4 |
 | `TRANSFORMATION_GUIDE` | `$MEP_SKILL_DIR/platforms/ssis/dataflow-guide.md` | Phase 4 Step 4.4 |
 
-If `MEP_SKILL_DIR` resolves to empty, the dbt TDD Fix Loop cannot run — inform the user and fall back to manual EWI scanning (Step 4.5).
+If `MEP_SKILL_DIR` resolves to empty, the prerequisite check in Step 0.1 was bypassed or the cache was invalidated mid-session — re-run the Step 0.1 check and resolve before continuing.
 
 ## Agent Wait Protocol
 
@@ -269,6 +270,60 @@ If significant technical decisions were made during migration, include a table:
 ## Phase 1: Assessment
 
 > **ANNOUNCE PROGRESS** — output banner: Phase 1 of 5 — Assessment | `[█░░░░░░░░░░░░░░░░░░░]` 5% | Status: In Progress
+
+### Step 0.1: Verify Plugin Prerequisites (MANDATORY FIRST)
+
+Before collecting any user inputs, verify that the `snowflake-migration` plugin is installed and the `migrate-etl-package` sub-skill is available. This ensures the full dbt TDD Fix Loop (Phase 4) can run.
+
+**1. Check if plugin is configured:**
+
+```bash
+grep -q "cortex-code-migrations" ~/.snowflake/cortex/settings.json && echo "CONFIGURED" || echo "NOT_CONFIGURED"
+```
+
+**2. Resolve `MEP_SKILL_DIR`:**
+
+```bash
+MEP_SKILL_DIR=$(find ~/.snowflake/cortex/remote-cache \
+  -path "*/migrate-objects/actions/migrate-etl-package" \
+  -maxdepth 8 -type d 2>/dev/null | head -1)
+echo "MEP_SKILL_DIR=$MEP_SKILL_DIR"
+```
+
+**3. Decision logic:**
+
+| Plugin Configured? | MEP_SKILL_DIR resolves? | Action |
+|--------------------|------------------------|--------|
+| Yes | Yes | Proceed to Step 1.0 |
+| Yes | No (empty) | Tell user: "The `snowflake-migration` plugin is configured but the cache is missing. Please restart Cortex Code to fetch the plugin, then re-invoke this skill." Use `AskUserQuestion` to confirm they've restarted. Re-run check. |
+| No | N/A | Tell user: "The `snowflake-migration` plugin is required for automated dbt testing and fixing (Phase 4). Please add it to your settings and restart Cortex Code." Display the following instructions, then use `AskUserQuestion` to confirm completion before proceeding. |
+
+**Installation instructions to display when plugin is missing:**
+
+> Add the following to `~/.snowflake/cortex/settings.json` inside the `"plugins"` array:
+>
+> ```json
+> "plugins": [
+>   "https://github.com/Snowflake-Labs/cortex-code-migrations/tree/preview/plugin"
+> ]
+> ```
+>
+> If the `"plugins"` key doesn't exist, create it as a top-level array.
+> Then restart Cortex Code — the plugin will be fetched and cached automatically.
+
+**4. Confirmation gate** — Use `AskUserQuestion`:
+
+- **Header**: "Plugin check"
+- **Question**: "The `snowflake-migration` plugin has been verified. Ready to proceed with SSIS migration assessment?"
+- **Option A**: "Yes — continue to Phase 1" (proceed to Step 1.0)
+- **Option B**: "I need help installing the plugin" (re-display instructions above)
+
+**ENFORCEMENT RULES**:
+- Do NOT proceed to Step 1.0 until `MEP_SKILL_DIR` resolves to a valid directory.
+- Do NOT skip this step or treat it as optional.
+- If the user explicitly declines to install the plugin, warn them that Phase 4 will fall back to manual EWI scanning (no automated dbt test-gen or fix loop) and ask for confirmation before continuing.
+
+---
 
 ### Step 1.0: Gather Required Paths (MANDATORY FIRST)
 
@@ -1027,6 +1082,135 @@ Send `shutdown_request` to each agent → wait for `shutdown_response` notificat
 
 ---
 
+### Step 4.4-SP: SP SQL TDD Fix Loop (MANDATORY when SP SQL selected for transformations)
+
+Replaces manual EWI marker scanning for stored procedure SQL. Runs `sp-test-gen` then `sp-fixer` for each SP generated in Step 4.2, fixing compilation errors, EWI markers, and logic bugs iteratively (up to 5 attempts per SP) before any deployment.
+
+> **Skip this step only if** dbt was selected in Phase 2 for Data Flow Transformations (use Step 4.4 instead), OR no SP SQL transformation files exist.
+
+**Sub-skill references:**
+
+```bash
+SP_TDD_DIR=~/.snowflake/cortex/skills/ssis-migration/sp-tdd
+SP_TEST_GEN_SKILL=$SP_TDD_DIR/sp-test-gen/SKILL.md
+SP_FIXER_SKILL=$SP_TDD_DIR/sp-fixer/SKILL.md
+TRACK_SP_STATUS_PY=~/.snowflake/cortex/skills/ssis-migration/scripts/track_sp_status.py
+SP_TEST_PATTERNS=~/.snowflake/cortex/skills/ssis-migration/references/sp_test_patterns.md
+```
+
+#### Step 4.4-SP.0: Detect SP SQL Files
+
+```bash
+find <OUTPUT_DIR>/implementation/sql/ -name "*sp_*" -o -name "*proc_*" -o -name "*procedure*" | grep -i "\.sql$"
+```
+
+If nothing found: skip to Step 4.5.
+
+#### Step 4.4-SP.1: Initialize SP Tracking
+
+Register each SP in the session status file — **sequential, one call per SP**:
+
+```bash
+python3 $TRACK_SP_STATUS_PY init \
+  <OUTPUT_DIR>/.sp-tdd/session_status.json \
+  <sp_name> \
+  <sp_file_path>
+```
+
+#### Step 4.4-SP.2: sp-test-gen Wave (parallel)
+
+Use `team_create` tool: `team_name="ssis-sp-tdd-<package_name>"`.
+
+Spawn **one `general-purpose` background agent per SP** (or per logical SP group if SPs are tightly coupled). Each agent generates test data + assertions from source `.dtsx` analysis.
+
+For each SP, spawn with `run_in_background=true`:
+- Instruction: Read `$SP_TEST_GEN_SKILL` Task Mode section
+- Context: `sp_name=<SP_NAME>`, `sp_file=<SP_FILE_PATH>`, `source_file=<DTSX_FILE_PATH>`, `migration_plan=<OUTPUT_DIR>/MIGRATION_PLAN.md`, `session_status_json=<OUTPUT_DIR>/.sp-tdd/session_status.json`, `test_patterns=$SP_TEST_PATTERNS`, `target_database=<DB>`, `target_schema=<SCHEMA>`, `warehouse=<WH>`, `connection=<CONNECTION_NAME>`
+
+**Max 5 agents per wave.** If >5 SPs: spawn first 5, follow Agent Wait Protocol, then spawn remaining.
+
+**Follow the Agent Wait Protocol: end your turn immediately after spawning. Do NOT issue further tool calls.**
+
+After notifications arrive — **validate ALL of these for EACH SP**:
+- `<OUTPUT_DIR>/.sp-tdd/tests/<sp_name>/seeds/` — at least 1 `.sql` file
+- `<OUTPUT_DIR>/.sp-tdd/tests/<sp_name>/assertions/` — at least 1 `.sql` file
+- `<OUTPUT_DIR>/.sp-tdd/tests/<sp_name>/test_harness_<sp_name>.sql` — must exist
+- `<OUTPUT_DIR>/.sp-tdd/tests/<sp_name>/test_report.md` — must exist
+
+If ANY artifact is missing: respawn that SP's agent (max 2 retries). After 2 retries: mark SP `failed` with reason `test-gen-exhaustion`.
+
+Update tracking — **sequential, one call per SP**:
+
+```bash
+python3 $TRACK_SP_STATUS_PY update \
+  <OUTPUT_DIR>/.sp-tdd/session_status.json \
+  <sp_name> --status sp-tested
+```
+
+#### Step 4.4-SP.3: Wave Checkpoint
+
+Before spawning fix agents, re-verify:
+1. Re-read `session_status.json` — confirm ALL SPs have status `sp-tested`
+2. Glob test artifacts for each SP — confirm files exist
+3. If any SP is still `pending`: do NOT proceed — respawn its test-gen agent
+
+#### Step 4.4-SP.4: sp-fixer Wave (parallel)
+
+Spawn **one `general-purpose` background agent per SP** that has ANY of:
+- Failing assertions (recorded in `test_report.md`)
+- Compilation errors (documented in `test_report.md` `bootstrap_status`)
+- `!!!RESOLVE EWI!!!` markers in SP SQL file
+
+**For SPs where ALL assertions passed and NO compilation errors**: no agent needed. Update status directly:
+
+```bash
+python3 $TRACK_SP_STATUS_PY update \
+  <OUTPUT_DIR>/.sp-tdd/session_status.json \
+  <sp_name> --status test-passed
+```
+
+For each failing SP, spawn with `run_in_background=true`:
+- Instruction: Read `$SP_FIXER_SKILL` Task Mode section
+- Context: `sp_name=<SP_NAME>`, `sp_file=<SP_FILE_PATH>`, `source_file=<DTSX_FILE_PATH>`, `test_report_path=<OUTPUT_DIR>/.sp-tdd/tests/<sp_name>/test_report.md`, `test_harness_path=<OUTPUT_DIR>/.sp-tdd/tests/<sp_name>/test_harness_<sp_name>.sql`, `session_status_json=<OUTPUT_DIR>/.sp-tdd/session_status.json`, `target_database=<DB>`, `target_schema=<SCHEMA>`, `warehouse=<WH>`, `connection=<CONNECTION_NAME>`
+
+**Follow the Agent Wait Protocol: end your turn immediately after spawning.**
+
+After all agents return:
+1. Read each agent's learnings file (`sp_learnings_<sp_name>.md`)
+2. Merge all learnings into `sp_fix_log.md`:
+   ```bash
+   python3 $TRACK_SP_STATUS_PY merge-learnings \
+     <OUTPUT_DIR>/.sp-tdd/session_status.json \
+     <OUTPUT_DIR>
+   ```
+3. Update status for each SP based on agent results:
+   ```bash
+   python3 $TRACK_SP_STATUS_PY update \
+     <OUTPUT_DIR>/.sp-tdd/session_status.json \
+     <sp_name> --status <fixed|failed|needs-user> [--reason "<reason>"]
+   ```
+
+#### Step 4.4-SP.5: Phase Gate (MANDATORY)
+
+```bash
+python3 $TRACK_SP_STATUS_PY validate-phase \
+  <OUTPUT_DIR>/.sp-tdd/session_status.json 4
+```
+
+**Gate passes when**: every SP has a terminal status (`test-passed`, `fixed`, `failed`, `needs-user`, `skipped`). Zero SPs in `pending`, `sp-tested`, or `fixing`.
+
+**Gate fails**: report the blocking SPs to the user. Do NOT proceed to Step 4.5 until they are resolved or the user explicitly accepts them as `needs-user`.
+
+#### Step 4.4-SP.6: Shutdown Team
+
+Send `shutdown_request` to each agent → wait for `shutdown_response` notifications → call `team_delete`.
+
+**Log the SP TDD Fix Loop outcome to `migration_phase_tracking.md`:**
+- SPs processed, fixed vs failed
+- Fix log: `<OUTPUT_DIR>/.sp-tdd/sp_fix_log.md`
+
+---
+
 ### Step 4.5: Post-SnowConvert dbt Validation Checklist (MANDATORY before Phase 5)
 
 > **Run this checklist on every SSIS migration that uses dbt**, regardless of project. These patterns are universal SnowConvert output issues that only surface at runtime with real data — they are undetectable by static SQL review or `snow dbt deploy`. Running this checklist reduces E2E debugging from 10+ SP call attempts to 1–2.
@@ -1272,6 +1456,8 @@ Then ask the following via `AskUserQuestion`:
 
 **Log** Phase 4 (including approval status) to `migration_phase_tracking.md` with start datetime, end datetime, duration, and the following stats:
 
+**⚠️ HARD ENFORCEMENT — LOG BEFORE PROCEEDING**: You MUST write the Phase 4 entry to `migration_phase_tracking.md` BEFORE spawning any Phase 5 deployment agents, calling `sql_execute`, or creating a team. If you skip this step, Phase 5 will proceed with an incomplete tracking file — this is a protocol violation. Write the log entry as your NEXT tool call after receiving the "Approved" answer.
+
 #### Phase 4 Required Stats in Tracking File
 
 1. **Configuration Inputs** — Database, Warehouse, Schemas, Connection name, and approach selections
@@ -1286,7 +1472,7 @@ Then ask the following via `AskUserQuestion`:
 
 ### Step 5.0: Pre-Deployment Gate (MANDATORY)
 
-Run these four checks before executing any SQL against Snowflake. **Do NOT proceed to Step 5.1 if any check fails.**
+Run these checks before executing any SQL against Snowflake. **Do NOT proceed to Step 5.1 if any check fails.**
 
 **1. dbt node terminal status** (only if Step 4.4 ran):
 
@@ -1296,6 +1482,15 @@ uv run --project $MEP_SKILL_DIR python $TRACK_STATUS_PY \
 ```
 
 All dbt nodes must have terminal status. Zero nodes in `pending` or `dbt-tested`. If this fails, return to Step 4.4 and resolve or mark blocking nodes as `needs-user`.
+
+**1b. SP terminal status** (only if Step 4.4-SP ran):
+
+```bash
+python3 ~/.snowflake/cortex/skills/ssis-migration/scripts/track_sp_status.py \
+  validate-phase <OUTPUT_DIR>/.sp-tdd/session_status.json 4
+```
+
+All SPs must have terminal status (`test-passed`, `fixed`, `failed`, `needs-user`, `skipped`). Zero SPs in `pending`, `sp-tested`, or `fixing`. If this fails, return to Step 4.4-SP and resolve or mark blocking SPs as `needs-user`.
 
 **2. EWI marker count in orchestration SQL** — zero blocking markers allowed:
 
@@ -1314,7 +1509,16 @@ dbt compile --project-dir <OUTPUT_DIR>/implementation/dbt_project/ \
 
 Must exit 0. If it fails, return to Step 4.4 (dbt TDD Fix Loop) to resolve remaining compilation errors.
 
-**4. profiles.yml auth field check**:
+**3b. SP compile check** (if SP SQL selected for transformations):
+
+```sql
+-- For each SP file, run sql_execute with only_compile=true
+-- to verify all SPs compile without errors
+```
+
+Must succeed for all SP files. If any fail, return to Step 4.4-SP to resolve.
+
+**4. profiles.yml auth field check** (if dbt project exists):
 
 ```bash
 grep -n "user:\|password:\|authenticator: externalbrowser\|token:\|private_key\|env_var" \
@@ -1323,7 +1527,7 @@ grep -n "user:\|password:\|authenticator: externalbrowser\|token:\|private_key\|
 
 Expected: 0 matches. If any of these are found, remove them. `authenticator: oauth` is **correct and required** — do not remove it. The only forbidden authenticator value is `externalbrowser` (and any non-oauth value). Valid `profiles.yml` contains: `type`, `account`, `authenticator: oauth`, `role`, `database`, `warehouse`, `schema`, `threads`.
 
-**If all 4 pass**: proceed to Step 5.1.
+**If all checks pass**: proceed to Step 5.1.
 **If any fail**: report the specific failure with file path and line number. Wait for resolution before deploying.
 
 ---
@@ -1469,6 +1673,8 @@ Write `<OUTPUT_DIR>/Solution_End_End_Testing.md` with:
 - Objects created inventory
 
 **Log** Phase 5 to `migration_phase_tracking.md` with start datetime, end datetime, duration, and the following stats:
+
+**⚠️ HARD ENFORCEMENT — LOG BEFORE DECLARING DONE**: You MUST write the Phase 5 entry to `migration_phase_tracking.md` BEFORE presenting the final "Migration Complete" message to the user, before deleting teams, and before marking any ctx task as done. If background agents were used, wait for their results, THEN write the log. Do NOT present completion to the user with Phase 5 unlogged — this is a protocol violation.
 
 #### Phase 5 Required Stats in Tracking File
 
