@@ -388,6 +388,34 @@ Generates Snowflake Semantic View YAML for Cortex Analyst. Maps columns, measure
 
 ---
 
+### `scripts/deploy_semantic_view.py`
+**Input:** `ssas_semantic_view.yaml`  **Output:** Deployed semantic view in Snowflake
+
+Deploys the generated semantic view YAML to a Snowflake schema. Handles CREATE OR REPLACE SEMANTIC VIEW DDL generation and execution.
+
+---
+
+### `scripts/build_dax_dag.py`
+**Input:** `ssas_inventory.json`  **Output:** DAX dependency DAG
+
+Builds a directed acyclic graph of DAX measure dependencies. Identifies calculation order, circular references, and dependency chains. Used to determine safe translation order in Phase 5.
+
+---
+
+### `scripts/generate_migration_mapping.py`
+**Input:** `ssas_inventory.json` + `deployment_assessment.json`  **Output:** Migration mapping document
+
+Generates a detailed object-by-object mapping from SSAS source objects to Snowflake target objects. Used as an intermediate artifact between assessment and DDL generation.
+
+---
+
+### `scripts/generate_powerbi_views.py`
+**Input:** `ssas_inventory.json` + `ssas_measures_translated.json`  **Output:** Power BI compatible views SQL
+
+Generates Snowflake views that are optimized for Power BI DirectQuery connectivity. Creates view definitions that align with Power BI's query generation patterns.
+
+---
+
 ### `references/dax-to-sql-patterns.md`
 Full DAX → SQL pattern library. Loaded during Phase 5.
 
@@ -400,6 +428,16 @@ SSAS → Snowflake object mapping, data types, storage mode → table type routi
 
 ### `references/ssas-features-complete.md`
 Deep reference for complex scenarios. 10 sections: compatibility levels, calculation groups, OLS, storage modes, partitioning, perspectives, bidirectional filters, calculated tables, date tables, translations.
+
+---
+
+### `references/known-issues.md`
+Documents known issues, limitations, and workarounds encountered during SSAS migrations. Includes edge cases in DAX translation, compatibility level quirks, and Snowflake-specific constraints.
+
+---
+
+### `references/pbi-measures-strategy.md`
+Strategy guide for handling Power BI Premium semantic model measures. Covers calculation group expansion patterns, measure folding strategies, and optimization techniques for large measure sets.
 
 ---
 
@@ -478,3 +516,11 @@ cortex reflect ./ssas_semantic_view.yaml
 uv run --project $SKILL_DIR python $SKILL_DIR/scripts/update_migration_status.py \
   --phase "Phase 5" --status completed --tokens 23500 --notes "47 measures translated"
 ```
+
+## Related Skills
+
+- **`ssas-dax-validator`** — Companion skill for validating DAX-to-SQL translations. Runs spot-check queries comparing original DAX results against translated SQL output in Snowflake.
+
+## Related
+
+- Cortex Code docs: https://docs.snowflake.com/en/user-guide/cortex-code/cortex-code
