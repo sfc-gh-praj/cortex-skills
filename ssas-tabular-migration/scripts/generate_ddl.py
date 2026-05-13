@@ -67,6 +67,16 @@ def quote_name(name: str) -> str:
     return name.upper().replace(" ", "_")
 
 
+def _select_col_expr(col: dict) -> str:
+    src = col.get("source_column")
+    ssas_name = col["name"]
+    if col.get("is_calculated"):
+        return quote_name(ssas_name)
+    if src and src != ssas_name:
+        return f"{quote_name(src)} AS {quote_name(ssas_name)}"
+    return quote_name(ssas_name)
+
+
 # ---------------------------------------------------------------------------
 # Partition → clustering key inference (used when no assessment provided)
 # ---------------------------------------------------------------------------
@@ -205,7 +215,7 @@ def table_ddl_interactive(table: dict, schema: str, measures_map: dict,
         f"  WAREHOUSE = {maint_wh}",
         f"  INITIALIZATION_WAREHOUSE = {init_wh}",
         f"AS SELECT",
-        "    " + ", ".join(quote_name(c["name"]) for c in table["columns"]) or "    *",
+        "    " + ", ".join(_select_col_expr(c) for c in table["columns"]) or "    *",
         f"FROM {full_name}_SOURCE;   -- replace _SOURCE with your actual source table",
         "",
     ]

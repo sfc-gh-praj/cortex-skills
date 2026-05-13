@@ -28,16 +28,27 @@ from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _to_str(val) -> str:
+    if isinstance(val, list):
+        return "\n".join(str(v) for v in val).strip()
+    return (str(val) if val else "").strip()
+
+
+# ---------------------------------------------------------------------------
 # Column / measure / partition parsers
 # ---------------------------------------------------------------------------
 
 def parse_column(col: dict) -> dict:
     return {
         "name": col.get("name", ""),
+        "source_column": col.get("sourceColumn"),
         "data_type": col.get("dataType", "string"),
         "is_hidden": col.get("isHidden", False),
         "is_calculated": col.get("type") == "calculated",
-        "expression": col.get("expression", "").strip() if col.get("type") == "calculated" else None,
+        "expression": _to_str(col.get("expression", "")) if col.get("type") == "calculated" else None,
         "format_string": col.get("formatString"),
         "description": col.get("description"),
         "is_key": col.get("isKey", False),
@@ -48,7 +59,7 @@ def parse_column(col: dict) -> dict:
 def parse_measure(m: dict) -> dict:
     return {
         "name": m.get("name", ""),
-        "expression": (m.get("expression") or "").strip(),
+        "expression": _to_str(m.get("expression", "")),
         "format_string": m.get("formatString"),
         "description": m.get("description"),
         "kpi": parse_kpi(m.get("kpi")) if m.get("kpi") else None,
@@ -112,8 +123,8 @@ def parse_calculation_group(t: dict) -> dict | None:
     for i, item in enumerate(cg.get("calculationItems", [])):
         items.append({
             "name":                    item.get("name", f"Item{i}"),
-            "expression":              (item.get("expression") or "").strip(),
-            "format_string_expression":(item.get("formatStringExpression") or "").strip(),
+            "expression":              _to_str(item.get("expression", "")),
+            "format_string_expression": _to_str(item.get("formatStringExpression", "")),
             "ordinal":                 item.get("ordinal", i),
         })
     # The column that holds calculation item names (visible in reports)
