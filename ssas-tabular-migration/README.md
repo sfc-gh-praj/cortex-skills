@@ -88,6 +88,11 @@ Walks you through seven phases to produce a complete, deployment-ready set of Sn
 | `ssas_ddl_with_views.sql` | Same DDL with calculated column views containing translated SQL expressions |
 | `ssas_measures_translated.json` | Per-expression translation results: original DAX → SQL, method (pattern/llm/manual_review), notes |
 | `ssas_semantic_view.yaml` | Snowflake Semantic View — tables, dimensions, facts, metrics (including N×M calc group expansions) |
+| `create_semantic_view.sql` | Deployable SQL: `CALL SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML(...)` with `$$`-quoted YAML |
+| `dax_dag.json` | DAX dependency graph — nodes, edges, topological sort order; updated with `sql_expr` after translation |
+| `dax_dependency_graph.html` | Self-contained ER diagram HTML — table relationships, join details, table detail cards |
+| `powerbi_views.sql` | Power BI zero-break migration views — exact SSAS names, column aliases, RELATED() JOINs |
+| `MIGRATION_MAPPING.md` | Detailed SSAS-vs-Snowflake mapping: tables, columns, measures, hierarchies, post-migration checklist |
 
 ---
 
@@ -196,6 +201,31 @@ Why it matters: Interactive Tables use `TARGET_LAG` to control how often Snowfla
 | 10–100 | COST NOTE — evaluate cache hit rate. Table flagged ⚠. |
 | 100–1,000 | No warning — generally justified. |
 | > 1,000 | No warning — strongly justified. |
+
+---
+
+### Phase 2b — DAX Dependency Graph (`build_dax_dag.py` + `visualize_dax_dag.py`)
+
+**What it does:**
+
+Analyses the DAX dependency chain across all measures and calculated columns. Produces a topological sort order used by Phase 5 to translate compound measures with their dependency SQL already available as context.
+
+**`build_dax_dag.py`** — builds the dependency DAG:
+- Physical / renamed columns as leaf nodes
+- Calculated columns with their column dependencies
+- Measures with column/calc-col dependencies
+- Compound measures (≥2 deps) listed separately
+- Cycle warnings for investigation
+
+**`visualize_dax_dag.py`** — generates an interactive HTML diagram:
+- ER-style SVG diagram of table joins (active + inactive relationships)
+- Table cards with column counts, row counts, measures, hierarchies
+- Summary stats panel
+- Join details table with cardinality and active/inactive status
+
+**Output:**
+- `dax_dag.json` — machine-readable dependency graph
+- `dax_dependency_graph.html` — visual review artifact
 
 ---
 
@@ -396,9 +426,16 @@ Deploys the generated semantic view YAML to a Snowflake schema. Handles CREATE O
 ---
 
 ### `scripts/build_dax_dag.py`
-**Input:** `ssas_inventory.json`  **Output:** DAX dependency DAG
+**Input:** `ssas_inventory.json`  **Output:** `dax_dag.json`
 
 Builds a directed acyclic graph of DAX measure dependencies. Identifies calculation order, circular references, and dependency chains. Used to determine safe translation order in Phase 5.
+
+---
+
+### `scripts/visualize_dax_dag.py`
+**Input:** `ssas_inventory.json` + optional `dax_dag.json`  **Output:** `dax_dependency_graph.html`
+
+Generates a self-contained HTML file (no external dependencies — pure SVG + vanilla JS) with an ER-style relationship diagram, table detail cards, summary stats, and join details table. Works both locally and in the Snowflake report sandbox.
 
 ---
 
@@ -413,6 +450,11 @@ Generates a detailed object-by-object mapping from SSAS source objects to Snowfl
 **Input:** `ssas_inventory.json` + `ssas_measures_translated.json`  **Output:** Power BI compatible views SQL
 
 Generates Snowflake views that are optimized for Power BI DirectQuery connectivity. Creates view definitions that align with Power BI's query generation patterns.
+
+---
+
+### `migration_demo_flow.html`
+Self-contained slideshow demonstrating the skill's live migration workflow across all phases, plus a post-migration output files checklist covering all 13 generated artifacts with verification actions.
 
 ---
 
@@ -516,6 +558,28 @@ cortex reflect ./ssas_semantic_view.yaml
 uv run --project $SKILL_DIR python $SKILL_DIR/scripts/update_migration_status.py \
   --phase "Phase 5" --status completed --tokens 23500 --notes "47 measures translated"
 ```
+
+## Post-Migration Checklist
+
+After migration completes, verify these output files:
+
+| File | What to Check |
+|---|---|
+| `ssas_inventory.json` | Table count, column mappings, missing columns list |
+| `deployment_assessment.json` | Table type assignments, clustering column choices |
+| `dax_dag.json` | Cycle warnings, compound measure dependencies |
+| `dax_dependency_graph.html` | Relationship diagram matches expected star/snowflake schema |
+| `MIGRATION_PLAN.md` | Approved before any DDL was executed |
+| `migration_status.md` | All phases show completed |
+| `ssas_ddl.sql` | Table names, column names, CLUSTER BY, TARGET_LAG |
+| `ssas_measures_translated.json` | All `manual_review` items resolved, SQL correctness |
+| `ssas_semantic_view.yaml` | Passes `cortex reflect`; no reserved word or cross-table ref warnings |
+| `create_semantic_view.sql` | Deployed via sql_execute tool |
+| `ssas_ddl_with_views.sql` | No `TODO DAX` or `NULL::VARCHAR` placeholders remain |
+| `powerbi_views.sql` | Column aliases match Power BI report expectations |
+| `MIGRATION_MAPPING.md` | Definitive reference for completed migration |
+
+---
 
 ## Related Skills
 
