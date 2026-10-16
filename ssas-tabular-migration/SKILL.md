@@ -26,6 +26,18 @@ Always use absolute paths for `--project` and script path:
 uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/<script>.py [args]
 ```
 
+> **SQL Execution: Use `sql_execute` tool, NOT `snow sql` CLI.**
+> The `snow sql` CLI uses external browser authentication and triggers repeated auth prompts
+> during migration, breaking the workflow. Always use the `sql_execute` tool for deploying DDL,
+> creating views, deploying semantic views (via `CALL SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML`),
+> and running validation queries. The `sql_execute` tool uses the already-authenticated
+> Cortex Code session — no browser auth required.
+>
+> **Mixed-case database names:** If the target database was created with double-quoted
+> mixed-case identifiers (e.g. `"My_Database"`), you must double-quote the database name
+> in all SQL and YAML references. In semantic view YAML inside a SQL string literal, use:
+> `database: ''"My_Database"''` (doubled single quotes around the double-quoted name).
+
 ---
 
 ## Before You Start — Resume Check
@@ -254,6 +266,23 @@ no measures at all.
 
 4. Note the output path — it will be used as `--dag` in Phase 5.
 
+5. **Generate interactive dependency graph** (HTML visualization):
+   ```bash
+   uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/visualize_dax_dag.py \
+     --dag       <OUTPUT_DIR>/dax_dag.json \
+     --output    <OUTPUT_DIR>/dax_dependency_graph.html \
+     --model-name "<MODEL_NAME>"
+   ```
+   This produces a self-contained HTML file (no external dependencies — pure SVG + vanilla JS)
+   that works both locally and in the Snowflake report sandbox. Features:
+   - Force-directed graph layout with drag, pan, and zoom
+   - Color-coded nodes: physical columns (gray), renamed (purple), calculated columns (orange), measures (blue)
+   - Dashed red edges for cross-table references, solid gray for same-table
+   - Filter by table, type (measures / calc cols / with-dependencies-only), or search by name
+   - Hover tooltip showing original DAX and translated SQL for each node
+
+   Show the user the generated HTML file path so they can review it.
+
 ---
 
 ## Phase 3 — Migration Plan
@@ -440,32 +469,35 @@ Do NOT execute `snow sql` without this explicit confirmation.
 
 6. Run `generate_semantic_view.py`:
 
-   **With DAG** (recommended — uses `inline_sql` from `dax_dag.json` for self-contained metrics):
+   **With DAG + DDL output** (recommended — generates YAML, Analyst YAML, AND a deployable SQL file):
    ```bash
    uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/generate_semantic_view.py \
      --inventory <OUTPUT_DIR>/ssas_inventory.json \
      --measures  <OUTPUT_DIR>/ssas_measures_translated.json \
      --dag       <OUTPUT_DIR>/dax_dag.json \
      --target-schema <DB.SCHEMA> \
-     --output    <OUTPUT_DIR>/ssas_semantic_view.yaml
+     --output    <OUTPUT_DIR>/ssas_semantic_view.yaml \
+     --generate-ddl <OUTPUT_DIR>/create_semantic_view.sql
    ```
+   This produces three files:
+   - `ssas_semantic_view.yaml` — the raw YAML (for review/version control)
+   - `ssas_semantic_view_analyst.yaml` — Cortex Analyst compatible YAML
+   - `create_semantic_view.sql` — `CALL SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML(...)` with
+     `$$`-quoted YAML, ready for direct execution via the `sql_execute` tool.
+     Mixed-case database names are automatically double-quoted in both the schema argument
+     and the YAML `base_table.database` fields.
+
+   **Deploy the semantic view** by reading `create_semantic_view.sql` and passing its content
+   to the `sql_execute` tool. Do NOT use `snow sql` CLI (triggers browser auth loops).
 
    **Without DAG:**
    ```bash
-   # Generate YAML only:
-   uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/generate_semantic_view.py \
-     --inventory <OUTPUT_DIR>/ssas_inventory.json \
-     --measures <OUTPUT_DIR>/ssas_measures_translated.json \
-     --target-schema <DB.SCHEMA> \
-     --output <OUTPUT_DIR>/ssas_semantic_view.yaml
-
-   # Generate YAML and deploy to Snowflake in one step:
    uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/generate_semantic_view.py \
      --inventory <OUTPUT_DIR>/ssas_inventory.json \
      --measures <OUTPUT_DIR>/ssas_measures_translated.json \
      --target-schema <DB.SCHEMA> \
      --output <OUTPUT_DIR>/ssas_semantic_view.yaml \
-     --deploy --connection <CONNECTION>
+     --generate-ddl <OUTPUT_DIR>/create_semantic_view.sql
    ```
 
    **Generation warnings** — fix all ⚠ before deploying:
@@ -486,7 +518,13 @@ Do NOT execute `snow sql` without this explicit confirmation.
    physical column names in `expr` fields, and skips RELATED() cross-table calculated
    columns (those are handled in Phase 5b Power BI views instead).
 
-7. Re-run `generate_ddl.py` with `--measures-json` to embed translated calculated columns:
+7. **CRITICAL — Re-run DDL to resolve TODO DAX placeholders.**
+   Phase 4 generates views with `NULL::VARCHAR AS <col> /* TODO DAX: ... */` for every
+   calculated column because the DAX hasn't been translated yet at that point. After
+   `convert_dax.py` completes, you **must** regenerate the DDL and redeploy the affected views.
+   Skipping this step leaves calculated columns returning NULL in production.
+
+   Re-run `generate_ddl.py` with `--measures-json` to embed translated calculated columns:
    ```bash
    uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/generate_ddl.py \
      --inventory <OUTPUT_DIR>/ssas_inventory.json \
@@ -494,6 +532,24 @@ Do NOT execute `snow sql` without this explicit confirmation.
      --measures-json <OUTPUT_DIR>/ssas_measures_translated.json \
      --target-schema <DB.SCHEMA> \
      --output <OUTPUT_DIR>/ssas_ddl_with_views.sql
+   ```
+
+   **Then redeploy the affected views** using the `sql_execute` tool (NOT `snow sql` CLI,
+   which triggers repeated browser auth prompts). Execute each `CREATE OR REPLACE VIEW`
+   statement from `ssas_ddl_with_views.sql` via `sql_execute`. Key patterns:
+
+   - **Same-table calculated columns** (e.g. `Margin = SalesAmount - TotalProductCost`):
+     Replace `NULL::VARCHAR AS MARGIN` with the translated SQL expression inline in the SELECT.
+   - **Cross-table RELATED() columns** (e.g. `RELATED('DimProductSubcategory'[Name])`):
+     Add a `LEFT JOIN` to the referenced table and alias the source table in the FROM clause.
+     Prefix all existing column references with the source table alias.
+   - **String-formatting calculated columns** (e.g. `MonthCalendar`, `DayOfWeek`):
+     Replace with the Snowflake SQL equivalent using `TO_CHAR`, `RIGHT`, `CONCAT`.
+
+   Verify no `TODO DAX` or `NULL::VARCHAR` placeholders remain:
+   ```bash
+   grep -c 'TODO DAX\|NULL::VARCHAR' <OUTPUT_DIR>/ssas_ddl_with_views.sql
+   # Must return 0
    ```
 
 8. Update status (use actual token count from convert_dax.py output if available):
@@ -520,26 +576,34 @@ Do NOT execute `snow sql` without this explicit confirmation.
 
 **Actions:**
 
-1. If not already deployed via `--deploy` flag in Phase 5, run `deploy_semantic_view.py`:
+1. **Preferred: Deploy via the generated DDL SQL file** (from `--generate-ddl` in Phase 5).
+   Read the SQL file and pass its content to the `sql_execute` tool:
+   ```
+   Read <OUTPUT_DIR>/create_semantic_view.sql
+   Pass the full content to sql_execute tool
+   ```
+   This file contains `CALL SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML(...)` with `$$`-quoted YAML.
+   Mixed-case database names are already handled. No browser auth needed.
+
+   **Fallback**: If `--generate-ddl` was not used, run `deploy_semantic_view.py`:
    ```bash
    uv run --project <SKILL_DIR> python <SKILL_DIR>/scripts/deploy_semantic_view.py \
      --yaml-file <OUTPUT_DIR>/ssas_semantic_view.yaml \
      --target-schema <DB.SCHEMA> \
      --connection <CONNECTION>
    ```
-   This calls `SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML()` to create the semantic view object.
-   The function's third parameter is `dry_run`: `FALSE` creates the view (default), `TRUE` validates only.
-   Use `--dry-run` flag to validate without creating.
 
 2. Verify deployment:
    ```sql
    SHOW SEMANTIC VIEWS IN SCHEMA <DB.SCHEMA>;
    ```
 
-3. Test with Cortex Analyst:
-   ```bash
-   cortex analyst query "show me total sales" --view <DB.SCHEMA.VIEW_NAME>
+3. Test with Cortex Analyst using `call_cortex_analyst` tool:
    ```
+   query: "show me total sales"
+   semantic_view: <DB.SCHEMA.VIEW_NAME>
+   ```
+   For mixed-case database names, quote the database: `"My_DB".SCHEMA.VIEW_NAME`
 
 ---
 

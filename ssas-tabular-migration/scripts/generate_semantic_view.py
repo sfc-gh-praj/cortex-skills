@@ -435,6 +435,9 @@ def main():
                         help="Override name for the semantic view (default: model name)")
     parser.add_argument("--deploy", action="store_true",
                         help="Deploy the semantic view to Snowflake after generating YAML")
+    parser.add_argument("--generate-ddl", default=None,
+                        help="Output a .sql file containing CALL SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML "
+                             "with the YAML embedded via $$-quoting. Ready for sql_execute tool.")
     parser.add_argument("--connection", default="COCO_JK",
                         help="Snowflake connection name for --deploy (default: COCO_JK)")
     parser.add_argument("--dag", default=None,
@@ -642,6 +645,47 @@ def main():
     print(f"  Relationships: {len(relationships)}")
     print(f"  Output:              {args.output}")
     print(f"  Analyst YAML output: {out_path_analyst}")
+
+    # Generate DDL SQL file if requested — contains CALL SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML
+    # with $$-quoted YAML, ready to be executed via sql_execute tool (no browser auth needed).
+    if args.generate_ddl:
+        # Strip comment lines from YAML for the SQL payload
+        clean_lines = [l for l in yaml_text.split("\n") if not l.strip().startswith("#")]
+        yaml_clean = "\n".join(clean_lines).strip()
+
+        # Handle mixed-case database names: quote if not all-uppercase
+        parts = schema.split(".")
+        db_name = parts[0] if len(parts) >= 1 else schema
+        schema_name = parts[1] if len(parts) >= 2 else "PUBLIC"
+        # First arg is a SQL string literal containing the fully-qualified schema name.
+        # For mixed-case DB names, embed double quotes inside the single-quoted string.
+        if db_name != db_name.upper():
+            fq_schema = f"""'"{db_name}"."{schema_name.upper()}"'"""
+        else:
+            fq_schema = f"""'{db_name}.{schema_name.upper()}'"""
+
+        # If the database name needs quoting in the YAML base_table references too,
+        # wrap it in single-quoted double-quotes (YAML inside SQL string literal)
+        if db_name != db_name.upper():
+            yaml_clean = yaml_clean.replace(
+                f"database: {db_name}",
+                f"database: '\"{db_name}\"'"
+            )
+
+        ddl_sql = (
+            f"CALL SYSTEM$CREATE_SEMANTIC_VIEW_FROM_YAML(\n"
+            f"  {fq_schema},\n"
+            f"  $$\n{yaml_clean}\n$$,\n"
+            f"  FALSE\n"
+            f")"
+        )
+
+        ddl_path = Path(args.generate_ddl)
+        ddl_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(ddl_path, "w", encoding="utf-8") as f:
+            f.write(ddl_sql)
+        print(f"  DDL SQL output:      {ddl_path}")
+        print(f"  Deploy via sql_execute tool: read the file and pass its content to sql_execute")
 
     # Deploy to Snowflake if requested
     if args.deploy:
